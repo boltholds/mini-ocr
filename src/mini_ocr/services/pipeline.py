@@ -149,39 +149,6 @@ class ProcessingPipeline:
             db.add(DocumentPage(document_id=document.id, page_number=idx, image_path=str(image_path)))
         db.commit()
 
-    def _deduplicate_section_candidates(self, candidates: list) -> list:
-        """Reduce overlapping LLM chunks before extraction.
-
-        Header detection can produce windows like 16-18 and 17-19. Keeping all
-        of them is expensive and increases duplicates. Prefer table candidates
-        and higher score, then keep overlapping chunks only when section_type
-        differs.
-        """
-        def priority(candidate):
-            source_bonus = 20 if candidate.source == "table" else 0
-            span = candidate.page_to - candidate.page_from + 1
-            return candidate.score + source_bonus - span
-
-        ordered = sorted(candidates, key=lambda c: (c.page_from, -priority(c), c.page_to))
-        kept = []
-        for candidate in ordered:
-            duplicate = False
-            for existing in kept:
-                if candidate.section_type != existing.section_type:
-                    continue
-                overlap_from = max(candidate.page_from, existing.page_from)
-                overlap_to = min(candidate.page_to, existing.page_to)
-                if overlap_from <= overlap_to:
-                    candidate_span = candidate.page_to - candidate.page_from + 1
-                    existing_span = existing.page_to - existing.page_from + 1
-                    overlap = overlap_to - overlap_from + 1
-                    if overlap / max(min(candidate_span, existing_span), 1) >= 0.67:
-                        duplicate = True
-                        break
-            if not duplicate:
-                kept.append(candidate)
-        return sorted(kept, key=lambda c: (c.page_from, c.section_type, -c.score))
-
     def _ocr_pages(self, db: Session, document: Document) -> None:
         pages = (
             db.query(DocumentPage)
@@ -288,9 +255,8 @@ class ProcessingPipeline:
             and c.page_to in valid_page_numbers
             and c.page_from <= c.page_to <= max_page_number
         ]
-        candidates = self._deduplicate_section_candidates(candidates)
         self.logger.info(
-            "section candidates after filtering/dedup: document_id=%s candidates=%s",
+            "section candidates after filtering: document_id=%s candidates=%s",
             document.id,
             [f"{c.section_type}:{c.page_from}-{c.page_to}:{c.source}" for c in candidates],
         )

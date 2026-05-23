@@ -262,3 +262,41 @@ rag.retrieve_for_validation
 
 This makes it easy to see where the pipeline spends time and whether every
 candidate passed through extraction, correction and validation.
+
+## Clean architecture refactor
+
+The processing code is split into small, testable modules:
+
+```text
+src/mini_ocr/services/langgraph_workflow.py      # document-level orchestration only
+src/mini_ocr/services/agents/extraction.py       # LLM extraction agent
+src/mini_ocr/services/agents/correction.py       # LangGraph correction router/subgraph
+src/mini_ocr/services/agents/validation.py       # RAG-assisted validation agent
+src/mini_ocr/utils/json_utils.py                 # robust LLM JSON parsing
+src/mini_ocr/utils/text.py                       # OCR/text heuristics
+src/mini_ocr/core/schema.py                      # small runtime schema compatibility migration
+```
+
+The correction subgraph is now explicit:
+
+```text
+route
+  -> keep | capitalizer | corrector | restorer | skip
+  -> post_filter
+```
+
+Original OCR fields are never overwritten. The system writes corrections only to `normalized_key`, `normalized_value`, `correction_confidence`, `correction_reason`, `correction_strategy`, `correction_status`, and `correction_orchestrator_reason`.
+
+## Tests
+
+Run:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+Current tests cover:
+
+- relaxed JSON parsing for LLM output;
+- OCR/text heuristics for Russian, Latin, mixed-script and caps keys;
+- deterministic extraction validator guardrails.

@@ -23,16 +23,6 @@ class Settings(BaseSettings):
     enable_rag_validation: bool = True
     rag_top_k: int = 5
 
-    # LLM runtime guardrails. Local Ollama models can hang on large OCR chunks;
-    # fail fast and let the workflow retry smaller page chunks.
-    llm_timeout_seconds: int = 60
-    llm_max_retries: int = 1
-
-    # Review policy: the model may suggest auto, but low-confidence output must
-    # stay needs_review for human verification.
-    validation_auto_threshold: float = 0.75
-    correction_auto_threshold: float = 0.70
-
     # Agent/workflow observability. Logs are emitted to console and optionally to a file.
     enable_agent_tracing: bool = True
     agent_log_level: str = "INFO"
@@ -43,7 +33,12 @@ class Settings(BaseSettings):
     llm_base_url: str | None = "http://localhost:11434/v1"
     llm_api_key: str | None = "ollama"
     llm_model: str = "gemma3:1b"
-    prompt_version: str = "terms_abbrev_extractor_v6_aggressive_correction"
+    prompt_version: str = "terms_abbrev_extractor_v9_clean_architecture"
+
+    llm_timeout_seconds: int = 60
+    llm_max_retries: int = 1
+    validation_auto_threshold: float = 0.75
+    correction_auto_threshold: float = 0.70
 
     class Config:
         env_file = ".env"

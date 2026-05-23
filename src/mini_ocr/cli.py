@@ -1,6 +1,7 @@
 from pathlib import Path
 import typer
 from mini_ocr.core.db import Base, SessionLocal, engine
+from mini_ocr.core.schema import ensure_runtime_schema
 from mini_ocr.models import Document, ExtractedItem  # noqa: F401
 from mini_ocr.services.pipeline import ProcessingPipeline
 
@@ -10,6 +11,7 @@ cli = typer.Typer()
 @cli.command()
 def init_db():
     Base.metadata.create_all(bind=engine)
+    ensure_runtime_schema(engine)
     typer.echo("DB initialized")
 
 
@@ -17,6 +19,7 @@ def init_db():
 def process(path: Path):
     """Process one PDF file or all PDF files in directory."""
     Base.metadata.create_all(bind=engine)
+    ensure_runtime_schema(engine)
     pipeline = ProcessingPipeline()
     db = SessionLocal()
     try:
