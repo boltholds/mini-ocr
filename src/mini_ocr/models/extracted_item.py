@@ -24,6 +24,9 @@ class ExtractedItem(Base):
     normalized_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     correction_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     correction_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    correction_strategy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    correction_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    correction_orchestrator_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="auto")  # auto | needs_review | approved | rejected
     extractor: Mapped[str] = mapped_column(String(32), default="llm")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

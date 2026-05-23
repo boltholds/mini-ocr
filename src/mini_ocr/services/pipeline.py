@@ -10,6 +10,7 @@ from mini_ocr.services.image_preprocessor import ImagePreprocessor
 from mini_ocr.services.ocr.paddleocr_service import PaddleOCRService
 from mini_ocr.services.section_detector import SectionDetector, PageText
 from mini_ocr.services.langgraph_workflow import LangGraphExtractionWorkflow
+from mini_ocr.services.observability import AgentTimer, get_logger
 
 
 class ProcessingPipeline:
@@ -18,6 +19,7 @@ class ProcessingPipeline:
         self.preprocessor = ImagePreprocessor()
         self.ocr = PaddleOCRService()
         self.detector = SectionDetector()
+        self.logger = get_logger("pipeline")
 
     def register_document(self, db: Session, src_path: Path, title: str | None = None) -> Document:
         file_hash = sha256_file(src_path)
@@ -52,11 +54,13 @@ class ProcessingPipeline:
         try:
             document.status = "rendering"
             db.commit()
-            self._render_pages(db, document)
+            with AgentTimer("pipeline.render_pages", document_id=document.id, title=document.title):
+                self._render_pages(db, document)
 
             document.status = "ocr_running"
             db.commit()
-            self._ocr_pages(db, document)
+            with AgentTimer("pipeline.ocr_pages", document_id=document.id, title=document.title):
+                self._ocr_pages(db, document)
 
             done_pages = (
                 db.query(DocumentPage)
@@ -71,7 +75,8 @@ class ProcessingPipeline:
 
             document.status = "extracting"
             db.commit()
-            self._extract_items(db, document)
+            with AgentTimer("pipeline.extract_items", document_id=document.id, title=document.title):
+                self._extract_items(db, document)
 
             failed_pages = (
                 db.query(DocumentPage)
@@ -112,6 +117,12 @@ class ProcessingPipeline:
         # current PDF. That later produces impossible page ranges like 30-32 in a
         # 20-page document. Re-render if DB rows do not match the real PDF page count.
         if existing_count == expected_count and max_existing_page == expected_count and all_images_exist:
+            self.logger.info(
+                "render cache hit: document_id=%s pages=%s image_dir=%s",
+                document.id,
+                existing_count,
+                image_dir,
+            )
             return
 
         db.query(OCRBlock).filter_by(document_id=document.id).delete(synchronize_session=False)
@@ -121,6 +132,13 @@ class ProcessingPipeline:
         db.query(DocumentPage).filter_by(document_id=document.id).delete(synchronize_session=False)
         db.commit()
 
+        self.logger.info(
+            "render cache miss: document_id=%s expected_pages=%s existing_pages=%s image_dir=%s",
+            document.id,
+            expected_count,
+            existing_count,
+            image_dir,
+        )
         image_paths = self.renderer.render(pdf_path, image_dir, force=True)
         if not image_paths:
             raise RuntimeError("PDF renderer produced no page images")
@@ -130,6 +148,39 @@ class ProcessingPipeline:
         for idx, image_path in enumerate(image_paths, start=1):
             db.add(DocumentPage(document_id=document.id, page_number=idx, image_path=str(image_path)))
         db.commit()
+
+    def _deduplicate_section_candidates(self, candidates: list) -> list:
+        """Reduce overlapping LLM chunks before extraction.
+
+        Header detection can produce windows like 16-18 and 17-19. Keeping all
+        of them is expensive and increases duplicates. Prefer table candidates
+        and higher score, then keep overlapping chunks only when section_type
+        differs.
+        """
+        def priority(candidate):
+            source_bonus = 20 if candidate.source == "table" else 0
+            span = candidate.page_to - candidate.page_from + 1
+            return candidate.score + source_bonus - span
+
+        ordered = sorted(candidates, key=lambda c: (c.page_from, -priority(c), c.page_to))
+        kept = []
+        for candidate in ordered:
+            duplicate = False
+            for existing in kept:
+                if candidate.section_type != existing.section_type:
+                    continue
+                overlap_from = max(candidate.page_from, existing.page_from)
+                overlap_to = min(candidate.page_to, existing.page_to)
+                if overlap_from <= overlap_to:
+                    candidate_span = candidate.page_to - candidate.page_from + 1
+                    existing_span = existing.page_to - existing.page_from + 1
+                    overlap = overlap_to - overlap_from + 1
+                    if overlap / max(min(candidate_span, existing_span), 1) >= 0.67:
+                        duplicate = True
+                        break
+            if not duplicate:
+                kept.append(candidate)
+        return sorted(kept, key=lambda c: (c.page_from, c.section_type, -c.score))
 
     def _ocr_pages(self, db: Session, document: Document) -> None:
         pages = (
@@ -147,7 +198,21 @@ class ProcessingPipeline:
                 image_path = Path(page.image_path)
                 if settings.enable_image_preprocessing:
                     image_path = self.preprocessor.preprocess(image_path)
-                result = self.ocr.recognize_page(image_path)
+                with AgentTimer(
+                    "ocr.page",
+                    document_id=document.id,
+                    page_number=page.page_number,
+                    image_path=str(image_path),
+                ) as trace:
+                    result = self.ocr.recognize_page(image_path)
+                    trace.set(
+                        text_length=len(result.text or ""),
+                        blocks_count=len(result.blocks),
+                        orientation=result.orientation,
+                        ocr_score=result.ocr_score,
+                        avg_confidence=result.avg_confidence,
+                        layout_type=result.layout_type,
+                    )
                 page.ocr_text = result.text
                 page.ocr_status = "done"
                 page.error_message = None
@@ -214,13 +279,21 @@ class ProcessingPipeline:
                 ocr_score=analysis.ocr_score if analysis else None,
             ))
 
-        candidates = self.detector.detect(page_texts)
+        with AgentTimer("section_detector.detect", document_id=document.id, pages_count=len(page_texts)) as trace:
+            candidates = self.detector.detect(page_texts)
+            trace.set(raw_candidates_count=len(candidates))
         candidates = [
             c for c in candidates
             if c.page_from in valid_page_numbers
             and c.page_to in valid_page_numbers
             and c.page_from <= c.page_to <= max_page_number
         ]
+        candidates = self._deduplicate_section_candidates(candidates)
+        self.logger.info(
+            "section candidates after filtering/dedup: document_id=%s candidates=%s",
+            document.id,
+            [f"{c.section_type}:{c.page_from}-{c.page_to}:{c.source}" for c in candidates],
+        )
         if not candidates:
             document.error_message = "No target sections found"
             db.commit()

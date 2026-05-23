@@ -189,3 +189,76 @@ docker compose run --rm app python -m mini_ocr.cli get-items "document.pdf"
 - добавить table-aware extraction по OCR bbox;
 - добавить Alembic migrations вместо `create_all`;
 - добавить метрики: OCR time, pages/sec, LLM tokens, items extracted, average confidence.
+
+
+## OCR correction agent
+
+The LangGraph workflow includes a dedicated `OCRCorrectionAgent` node between extraction and validation:
+
+```text
+extract -> save -> normalize -> validate
+```
+
+The correction agent runs for every low-confidence / `needs_review` candidate and for OCR-noisy keys. It does not overwrite the original `key`, `value` or `source_text`. Instead it writes suggestion fields:
+
+- `normalized_key`
+- `normalized_value`
+- `correction_confidence`
+- `correction_reason`
+
+For uncertain OCR cases, the agent still returns a `normalized_key` hypothesis, but keeps the item in `needs_review`. This is useful for old scans where Cyrillic and Latin glyphs are often mixed by OCR.
+
+If the database was created before this version, run once:
+
+```sql
+ALTER TABLE extracted_items ADD COLUMN IF NOT EXISTS normalized_key TEXT;
+ALTER TABLE extracted_items ADD COLUMN IF NOT EXISTS normalized_value TEXT;
+ALTER TABLE extracted_items ADD COLUMN IF NOT EXISTS correction_confidence DOUBLE PRECISION;
+ALTER TABLE extracted_items ADD COLUMN IF NOT EXISTS correction_reason TEXT;
+```
+
+Recommended flags:
+
+```env
+ENABLE_LANGGRAPH_WORKFLOW=true
+ENABLE_OCR_CORRECTION_AGENT=true
+ENABLE_AGENT_VALIDATION=true
+ENABLE_RAG_VALIDATION=true
+PROMPT_VERSION=terms_abbrev_extractor_v6_aggressive_correction
+```
+
+## Agent tracing and timing
+
+The LangGraph workflow now logs every important stage and every agent call.
+Tracing is controlled by environment variables:
+
+```env
+ENABLE_AGENT_TRACING=true
+AGENT_LOG_LEVEL=INFO
+AGENT_LOG_FILE=logs/agents.log
+```
+
+The log format is line-oriented and JSON-like. Each timed operation emits a
+`start` event and an `end` event with `duration_ms`; failures emit an `error`
+event with the exception type/message.
+
+Examples of stages:
+
+```text
+pipeline.render_pages
+pipeline.ocr_pages
+ocr.page
+section_detector.detect
+langgraph.workflow
+agent.extractor
+workflow.save_node
+workflow.normalize_node
+agent.ocr_correction
+rag.retrieve_for_correction
+workflow.validate_node
+agent.rag_validation
+rag.retrieve_for_validation
+```
+
+This makes it easy to see where the pipeline spends time and whether every
+candidate passed through extraction, correction and validation.

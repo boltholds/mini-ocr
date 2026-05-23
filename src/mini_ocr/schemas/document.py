@@ -24,6 +24,9 @@ class ItemOut(BaseModel):
     normalized_value: str | None = None
     correction_confidence: float | None = None
     correction_reason: str | None = None
+    correction_strategy: str | None = None
+    correction_status: str | None = None
+    correction_orchestrator_reason: str | None = None
     status: str
     extractor: str
 

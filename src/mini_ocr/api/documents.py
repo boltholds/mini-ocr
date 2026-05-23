@@ -44,7 +44,12 @@ def process_document(
     try:
         return pipeline.process_document(db, document_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        detail = str(exc)
+        if "Document not found" in detail:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=500, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
