@@ -55,8 +55,8 @@ class SectionDetectorStrategyTest(unittest.TestCase):
         class DuplicateStrategy:
             def detect(self, ctx: SectionDetectionContext) -> list[SectionCandidate]:
                 return [
-                    SectionCandidate("terms", "a", 1, 1, 90, source="table"),
-                    SectionCandidate("terms", "b", 1, 1, 80, source="table"),
+                    SectionCandidate(section_type="terms", text="a", page_from=1, page_to=1, score=90, source="table"),
+                    SectionCandidate(section_type="terms", text="b", page_from=1, page_to=1, score=80, source="table"),
                 ]
 
         detector = SectionDetector(strategies=[DuplicateStrategy()])
@@ -68,7 +68,7 @@ class SectionDetectorStrategyTest(unittest.TestCase):
     def test_custom_strategy_can_be_injected(self):
         class CustomStrategy:
             def detect(self, ctx: SectionDetectionContext) -> list[SectionCandidate]:
-                return [SectionCandidate("custom", "text", 10, 10, 100, source="custom")]
+                return [SectionCandidate(section_type="custom", text="text", page_from=10, page_to=10, score=100, source="custom")]
 
         detector = SectionDetector(strategies=[CustomStrategy()])
         candidates = detector.detect([])

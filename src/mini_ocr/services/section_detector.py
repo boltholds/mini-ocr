@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
+from pydantic import BaseModel, ConfigDict
 from rapidfuzz import fuzz
 
 
@@ -43,8 +44,9 @@ NEXT_SECTION_MARKERS = [
 ]
 
 
-@dataclass(frozen=True)
-class SectionCandidate:
+class SectionCandidate(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     section_type: str
     text: str
     page_from: int
