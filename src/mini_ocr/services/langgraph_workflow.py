@@ -11,14 +11,14 @@ from sqlalchemy.orm import Session
 from mini_ocr.core.config import settings
 from mini_ocr.models import Document, ExtractedItem, ExtractionJob
 from mini_ocr.schemas.extraction import ExtractedEntity
-from mini_ocr.services.agents.correction import OCRCorrectionWorkflow
+from mini_ocr.services.correction_service import OCRCorrectionWorkflow
 from mini_ocr.services.agents.extraction import ExtractionAgent
 from mini_ocr.services.agents.validation import CandidateValidationAgent
 from mini_ocr.services.extraction_validator import ExtractionValidator
 from mini_ocr.services.hash_utils import sha256_text
 from mini_ocr.services.observability import AgentTimer, get_logger
 from mini_ocr.services.section_detector import SectionCandidate
-from mini_ocr.utils.text import looks_ocr_noisy
+from mini_ocr.services.policies.text import OCR_NOISY_TEXT_POLICY
 
 
 class WorkflowState(TypedDict):
@@ -339,7 +339,7 @@ class LowConfidenceNormalizationStrategy:
 
 class OCRNoisyNormalizationStrategy:
     def should_normalize(self, item: ExtractedItem) -> bool:
-        return looks_ocr_noisy(item.key)
+        return OCR_NOISY_TEXT_POLICY.matches(item.key)
 
 
 class NormalizationPolicy:

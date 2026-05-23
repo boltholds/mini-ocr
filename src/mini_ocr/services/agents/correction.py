@@ -1,32 +1,32 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, TypedDict
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, TypedDict
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
 from mini_ocr.core.config import settings
-from mini_ocr.models import ExtractedItem, ItemValidation
 from mini_ocr.services.llm.client import build_chat_model
 from mini_ocr.services.observability import AgentTimer
-from mini_ocr.services.rag_store import RagMatch, RagStore
 from mini_ocr.utils.json_utils import loads_json_relaxed
-from mini_ocr.utils.text import (
-    clean_optional_text,
-    clamp_float,
-    is_clean_cyrillic_caps,
-    looks_clean_russian_term,
-    looks_latin_or_foreign,
-    titlecase_cyrillic_caps,
+from mini_ocr.services.policies.text import (
+    CLEAN_CYRILLIC_CAPS_TEXT_POLICY,
+    CLEAN_RUSSIAN_TERM_TEXT_POLICY,
+    LATIN_OR_FOREIGN_TEXT_POLICY,
+    TextPolicy,
 )
+from mini_ocr.utils.text import clean_optional_text, clamp_float, titlecase_cyrillic_caps
+
+
+CorrectionStrategy = Literal["keep", "capitalizer", "corrector", "restorer", "skip"]
 
 
 class CorrectionRoute(BaseModel):
-    strategy: Literal["keep", "capitalizer", "corrector", "restorer", "skip"]
+    strategy: CorrectionStrategy
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
 
@@ -36,7 +36,7 @@ class CorrectionSuggestion(BaseModel):
     normalized_value: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
-    strategy: str
+    strategy: CorrectionStrategy
     status: str
     orchestrator_reason: str | None = None
 
@@ -56,7 +56,153 @@ class CorrectionState(TypedDict, total=False):
     suggestion: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CorrectionRoutingContext:
+    key: str
+    candidate: dict[str, Any]
+    matches: list[dict[str, Any]]
+
+
+class CorrectionRoutingPolicy(Protocol):
+    """May choose a correction route before the LLM is called."""
+
+    def choose(self, ctx: CorrectionRoutingContext) -> CorrectionRoute | None:
+        ...
+
+
+class CorrectionRouteAdjustmentPolicy(Protocol):
+    """May rewrite an already selected route after LLM/pre-routing."""
+
+    def adjust(self, ctx: CorrectionRoutingContext, route: CorrectionRoute) -> CorrectionRoute:
+        ...
+
+
+@dataclass(frozen=True)
+class TextRoutePolicy:
+    text_policy: TextPolicy
+    strategy: CorrectionStrategy
+    confidence: float
+    reason: str | None = None
+
+    def choose(self, ctx: CorrectionRoutingContext) -> CorrectionRoute | None:
+        if not self.text_policy.matches(ctx.key):
+            return None
+        return CorrectionRoute(
+            strategy=self.strategy,
+            confidence=self.confidence,
+            reason=self.reason or self.text_policy.reason,
+        )
+
+
+class LLMRoutingPolicy:
+    def __init__(self, chain: Any) -> None:
+        self.chain = chain
+
+    def choose(self, ctx: CorrectionRoutingContext) -> CorrectionRoute | None:
+        content = self.chain.invoke({
+            "candidate_json": json.dumps(ctx.candidate, ensure_ascii=False),
+            "rag_json": json.dumps(ctx.matches, ensure_ascii=False),
+        })
+        data = loads_json_relaxed(content)
+        return CorrectionRoute.model_validate({
+            "strategy": normalize_strategy(data.get("strategy")),
+            "confidence": clamp_float(data.get("confidence"), default=0.5),
+            "reason": str(data.get("reason") or "Маршрут выбран агентом."),
+        })
+
+
+@dataclass(frozen=True)
+class ForceTextRouteAdjustmentPolicy:
+    text_policy: TextPolicy
+    strategy: CorrectionStrategy
+    min_confidence: float
+    reason: str | None = None
+
+    def adjust(self, ctx: CorrectionRoutingContext, route: CorrectionRoute) -> CorrectionRoute:
+        if not self.text_policy.matches(ctx.key):
+            return route
+        return CorrectionRoute(
+            strategy=self.strategy,
+            confidence=max(route.confidence, self.min_confidence),
+            reason=self.reason or self.text_policy.reason,
+        )
+
+
+@dataclass(frozen=True)
+class RejectBadCapitalizerPolicy:
+    caps_policy: TextPolicy = CLEAN_CYRILLIC_CAPS_TEXT_POLICY
+    clean_term_policy: TextPolicy = CLEAN_RUSSIAN_TERM_TEXT_POLICY
+
+    def adjust(self, ctx: CorrectionRoutingContext, route: CorrectionRoute) -> CorrectionRoute:
+        if route.strategy != "capitalizer" or self.caps_policy.matches(ctx.key):
+            return route
+        fallback: CorrectionStrategy = "keep" if self.clean_term_policy.matches(ctx.key) else "skip"
+        return CorrectionRoute(
+            strategy=fallback,
+            confidence=0.75,
+            reason="Маршрут capitalizer отклонён safety-net: ключ не является чистым русским капсом.",
+        )
+
+
+@dataclass(frozen=True)
+class RejectActiveCorrectionForCleanRussianPolicy:
+    clean_term_policy: TextPolicy = CLEAN_RUSSIAN_TERM_TEXT_POLICY
+
+    def adjust(self, ctx: CorrectionRoutingContext, route: CorrectionRoute) -> CorrectionRoute:
+        if route.strategy in {"corrector", "restorer"} and self.clean_term_policy.matches(ctx.key):
+            return CorrectionRoute(
+                strategy="keep",
+                confidence=max(route.confidence, 0.85),
+                reason="Термин уже читаемый; активная коррекция не требуется.",
+            )
+        return route
+
+
+class CorrectionRoutingPipeline:
+    def __init__(
+        self,
+        pre_policies: list[CorrectionRoutingPolicy],
+        llm_policy: CorrectionRoutingPolicy,
+        adjustment_policies: list[CorrectionRouteAdjustmentPolicy],
+    ) -> None:
+        self.pre_policies = pre_policies
+        self.llm_policy = llm_policy
+        self.adjustment_policies = adjustment_policies
+
+    def choose(self, ctx: CorrectionRoutingContext) -> CorrectionRoute:
+        route: CorrectionRoute | None = None
+        for policy in self.pre_policies:
+            route = policy.choose(ctx)
+            if route is not None:
+                break
+        if route is None:
+            route = self.llm_policy.choose(ctx)
+        if route is None:
+            route = CorrectionRoute(strategy="skip", confidence=0.0, reason="Не удалось выбрать маршрут коррекции.")
+        for policy in self.adjustment_policies:
+            route = policy.adjust(ctx, route)
+        return route
+
+
+def default_correction_routing_pipeline(chain: Any) -> CorrectionRoutingPipeline:
+    return CorrectionRoutingPipeline(
+        pre_policies=[
+            TextRoutePolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+            TextRoutePolicy(CLEAN_CYRILLIC_CAPS_TEXT_POLICY, "capitalizer", 0.85),
+            TextRoutePolicy(CLEAN_RUSSIAN_TERM_TEXT_POLICY, "keep", 0.9),
+        ],
+        llm_policy=LLMRoutingPolicy(chain),
+        adjustment_policies=[
+            ForceTextRouteAdjustmentPolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+            RejectBadCapitalizerPolicy(),
+            RejectActiveCorrectionForCleanRussianPolicy(),
+        ],
+    )
+
+
 class CorrectionOrchestratorAgent:
+    """Routes a correction candidate to one concrete correction strategy."""
+
     def __init__(self) -> None:
         self.llm = build_chat_model()
         self.prompt = ChatPromptTemplate.from_messages([
@@ -90,44 +236,24 @@ class CorrectionOrchestratorAgent:
             ),
         ])
         self.chain = self.prompt | self.llm | StrOutputParser()
+        self.routing = default_correction_routing_pipeline(self.chain)
 
     def choose(self, candidate: dict[str, Any], matches: list[dict[str, Any]]) -> CorrectionRoute:
-        # Cheap deterministic exits keep the LLM from over-processing obvious cases.
-        key = str(candidate.get("key") or "").strip()
-        if looks_latin_or_foreign(key):
-            return CorrectionRoute(strategy="skip", confidence=0.9, reason="Ключ выглядит как латинский термин или иностранный эквивалент.")
-        if looks_clean_russian_term(key):
-            return CorrectionRoute(strategy="keep", confidence=0.9, reason="Термин выглядит как читаемый русский термин; коррекция не требуется.")
-        if is_clean_cyrillic_caps(key):
-            return CorrectionRoute(strategy="capitalizer", confidence=0.85, reason="Термин написан заглавными русскими буквами.")
-
-        content = self.chain.invoke({
-            "candidate_json": json.dumps(candidate, ensure_ascii=False),
-            "rag_json": json.dumps(matches, ensure_ascii=False),
-        })
-        data = loads_json_relaxed(content)
-        route = CorrectionRoute.model_validate({
-            "strategy": str(data.get("strategy") or "skip").strip().lower(),
-            "confidence": clamp_float(data.get("confidence"), default=0.5),
-            "reason": str(data.get("reason") or "Маршрут выбран агентом."),
-        })
-        return self._safety_net(key, route)
-
-    def _safety_net(self, key: str, route: CorrectionRoute) -> CorrectionRoute:
-        if looks_latin_or_foreign(key):
-            return CorrectionRoute(strategy="skip", confidence=max(route.confidence, 0.9), reason="Ключ выглядит как латинский термин или иностранный эквивалент.")
-        if route.strategy == "capitalizer" and not is_clean_cyrillic_caps(key):
-            return CorrectionRoute(strategy="keep" if looks_clean_russian_term(key) else "skip", confidence=0.75, reason="Маршрут capitalizer отклонён safety-net: ключ не является чистым русским капсом.")
-        if route.strategy in {"corrector", "restorer"} and looks_clean_russian_term(key):
-            return CorrectionRoute(strategy="keep", confidence=0.85, reason="Термин уже читаемый; активная коррекция не требуется.")
-        return route
+        ctx = CorrectionRoutingContext(
+            key=str(candidate.get("key") or "").strip(),
+            candidate=candidate,
+            matches=matches,
+        )
+        return self.routing.choose(ctx)
 
 
-class LightOCRCorrectorAgent:
-    def __init__(self) -> None:
+class LLMCorrectionAgent:
+    """Base LLM action: prompt invocation and JSON parsing only."""
+
+    def __init__(self, system_prompt: str) -> None:
         self.llm = build_chat_model()
         self.prompt = ChatPromptTemplate.from_messages([
-            ("system", "Ты исправляешь только лёгкие OCR-ошибки в ключе термина. Не восстанавливай по смыслу. Верни только JSON."),
+            ("system", system_prompt),
             (
                 "human",
                 "Candidate JSON:\n{candidate_json}\n\nRAG matches JSON:\n{rag_json}\n\n"
@@ -136,221 +262,316 @@ class LightOCRCorrectorAgent:
         ])
         self.chain = self.prompt | self.llm | StrOutputParser()
 
-    def correct(self, state: CorrectionState) -> CorrectionSuggestion:
-        data = self._invoke(state)
-        return _suggestion_from_data(data, state, "corrector", "corrected")
-
-    def _invoke(self, state: CorrectionState) -> dict[str, Any]:
+    def invoke(self, state: CorrectionState) -> dict[str, Any]:
         content = self.chain.invoke({
-            "candidate_json": json.dumps(_candidate_payload(state), ensure_ascii=False),
+            "candidate_json": json.dumps(candidate_payload(state), ensure_ascii=False),
             "rag_json": json.dumps(state.get("rag_matches", []), ensure_ascii=False),
         })
         return loads_json_relaxed(content)
 
 
-class DefinitionRestorerAgent(LightOCRCorrectorAgent):
+class LightOCRCorrectorAgent(LLMCorrectionAgent):
     def __init__(self) -> None:
-        self.llm = build_chat_model()
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", "Ты осторожно восстанавливаешь сильно повреждённый OCR-ключ по определению и RAG. Если уверенности нет — верни исходный key и confidence 0. Верни только JSON."),
-            (
-                "human",
-                "Candidate JSON:\n{candidate_json}\n\nRAG matches JSON:\n{rag_json}\n\n"
-                "Output schema:\n{{\"normalized_key\": \"string\", \"normalized_value\": null, \"confidence\": 0.0, \"reason\": \"причина на русском\"}}",
-            ),
-        ])
-        self.chain = self.prompt | self.llm | StrOutputParser()
-
-    def restore(self, state: CorrectionState) -> CorrectionSuggestion:
-        data = self._invoke(state)
-        return _suggestion_from_data(data, state, "restorer", "restored")
+        super().__init__("Ты исправляешь только лёгкие OCR-ошибки в ключе термина. Не восстанавливай по смыслу. Верни только JSON.")
 
 
-class OCRCorrectionWorkflow:
-    """Small LangGraph subgraph for one saved extracted item."""
+class DefinitionRestorerAgent(LLMCorrectionAgent):
+    def __init__(self) -> None:
+        super().__init__("Ты осторожно восстанавливаешь сильно повреждённый OCR-ключ по определению и RAG. Если уверенности нет — верни исходный key и confidence 0. Верни только JSON.")
+
+
+class CorrectionOperation(Protocol):
+    strategy: CorrectionStrategy
+    status: str
+    timer_stage: str
+
+    def suggest(self, state: CorrectionState, route: CorrectionRoute) -> CorrectionSuggestion:
+        ...
+
+
+class KeepOperation:
+    strategy: CorrectionStrategy = "keep"
+    status = "kept"
+    timer_stage = "agent.keep_correction"
+
+    def suggest(self, state: CorrectionState, route: CorrectionRoute) -> CorrectionSuggestion:
+        return CorrectionSuggestion(
+            normalized_key=state["key"],
+            normalized_value=None,
+            confidence=0.0,
+            reason=route.reason,
+            strategy=self.strategy,
+            status=self.status,
+            orchestrator_reason=route.reason,
+        )
+
+
+class SkipOperation:
+    strategy: CorrectionStrategy = "skip"
+    status = "skipped"
+    timer_stage = "agent.skip_correction"
+
+    def suggest(self, state: CorrectionState, route: CorrectionRoute) -> CorrectionSuggestion:
+        return CorrectionSuggestion(
+            normalized_key=state["key"],
+            normalized_value=None,
+            confidence=0.0,
+            reason=route.reason,
+            strategy=self.strategy,
+            status=self.status,
+            orchestrator_reason=route.reason,
+        )
+
+
+class CapitalizerOperation:
+    strategy: CorrectionStrategy = "capitalizer"
+    status = "capitalized"
+    timer_stage = "agent.capitalizer"
+
+    def suggest(self, state: CorrectionState, route: CorrectionRoute) -> CorrectionSuggestion:
+        normalized = titlecase_cyrillic_caps(state["key"])
+        changed = normalized != state["key"]
+        return CorrectionSuggestion(
+            normalized_key=normalized,
+            normalized_value=None,
+            confidence=0.75 if changed else 0.0,
+            reason=route.reason,
+            strategy=self.strategy,
+            status=self.status if changed else "kept",
+            orchestrator_reason=route.reason,
+        )
+
+
+class LLMCorrectionOperation:
+    def __init__(self, strategy: CorrectionStrategy, status: str, timer_stage: str, agent: LLMCorrectionAgent) -> None:
+        self.strategy = strategy
+        self.status = status
+        self.timer_stage = timer_stage
+        self.agent = agent
+
+    def suggest(self, state: CorrectionState, route: CorrectionRoute) -> CorrectionSuggestion:
+        data = self.agent.invoke(state)
+        suggestion = self.suggestion_from_data(data, state, self.strategy, self.status)
+        suggestion.orchestrator_reason = route.reason
+        return suggestion
+    
+    def suggestion_from_data(self, data: dict[str, Any], state: CorrectionState, strategy: CorrectionStrategy, status: str) -> CorrectionSuggestion:
+        normalized_key = str(data.get("normalized_key") or state["key"]).strip() or state["key"]
+        confidence = clamp_float(data.get("confidence"), default=0.0)
+        if normalized_key == state["key"]:
+            confidence = 0.0
+            status = "unrecoverable" if strategy == "restorer" else "unchanged"
+        return CorrectionSuggestion(
+            normalized_key=normalized_key,
+            normalized_value=clean_optional_text(data.get("normalized_value")),
+            confidence=confidence,
+            reason=str(data.get("reason") or f"{strategy} suggestion"),
+            strategy=strategy,
+            status=status,
+        )
+
+
+
+class RouteNode:
+    def __init__(self, orchestrator: CorrectionOrchestratorAgent) -> None:
+        self.orchestrator = orchestrator
+
+    def __call__(self, state: CorrectionState) -> CorrectionState:
+        with AgentTimer("agent.correction_orchestrator", document_id=state["document_id"], item_id=state["item_id"], key=state["key"], model=settings.llm_model) as trace:
+            route = self.orchestrator.choose(candidate_payload(state), state.get("rag_matches", []))
+            trace.set(selected_strategy=route.strategy, confidence=route.confidence, reason=route.reason[:240])
+        return {**state, "route": route.model_dump()}
+
+
+class CorrectionActionNode:
+    """Generic graph node for keep/skip/capitalizer/corrector/restorer.
+
+    The node protocol is identical for all correction actions: read route from
+    state, run timed operation, convert failures to a safe suggestion, write the
+    suggestion back to state.
+    """
+
+    def __init__(self, operation: CorrectionOperation) -> None:
+        self.operation = operation
+
+    def __call__(self, state: CorrectionState) -> CorrectionState:
+        route = CorrectionRoute.model_validate(state["route"])
+        with AgentTimer(self.operation.timer_stage, document_id=state["document_id"], item_id=state["item_id"], key=state["key"]) as trace:
+            try:
+                suggestion = self.operation.suggest(state, route)
+            except Exception as exc:
+                suggestion = self.failed_suggestion(state, self.operation.strategy, route.reason, exc)
+            trace.set(normalized_key=suggestion.normalized_key, correction_confidence=suggestion.confidence, status=suggestion.status)
+        return with_suggestion(state, suggestion)
+    
+    def failed_suggestion(self, state: CorrectionState, strategy: CorrectionStrategy, orchestrator_reason: str | None, exc: Exception) -> CorrectionSuggestion:
+        return CorrectionSuggestion(
+            normalized_key=state["key"],
+            normalized_value=None,
+            confidence=0.0,
+            reason=f"Ошибка {strategy}: {exc}",
+            strategy=strategy,
+            status="unrecoverable" if strategy in {"corrector", "restorer"} else "skipped",
+            orchestrator_reason=orchestrator_reason,
+        )
+
+
+class NormalizedKeyPolicy(Protocol):
+    def is_bad(self, original_key: str, normalized_key: str | None) -> bool:
+        ...
+
+
+class EmptyNormalizedKeyPolicy:
+    def is_bad(self, original_key: str, normalized_key: str | None) -> bool:
+        return not normalized_key or not normalized_key.strip()
+
+
+class TooLongNormalizedKeyPolicy:
+    def __init__(self, max_chars: int = 100, max_words: int = 8) -> None:
+        self.max_chars = max_chars
+        self.max_words = max_words
+
+    def is_bad(self, original_key: str, normalized_key: str | None) -> bool:
+        nk = (normalized_key or "").strip()
+        return len(nk) > self.max_chars or len(nk.split()) > self.max_words
+
+
+class DefinitionFragmentNormalizedKeyPolicy:
+    def __init__(self, fragments: tuple[str, ...] | None = None) -> None:
+        self.fragments = fragments or ("представляет собой", "образуется", "содержит", "является", "под ними", "вследствие")
+
+    def is_bad(self, original_key: str, normalized_key: str | None) -> bool:
+        nk = (normalized_key or "").strip().lower()
+        return any(fragment in nk for fragment in self.fragments)
+
+
+class ForeignOriginalChangedPolicy:
+    def __init__(self, foreign_policy: TextPolicy = LATIN_OR_FOREIGN_TEXT_POLICY) -> None:
+        self.foreign_policy = foreign_policy
+
+    def is_bad(self, original_key: str, normalized_key: str | None) -> bool:
+        return self.foreign_policy.matches(original_key) and (original_key or "").strip() != (normalized_key or "").strip()
+
+
+class NormalizedKeyGuard:
+    def __init__(self, policies: list[NormalizedKeyPolicy] | None = None) -> None:
+        self.policies = policies or [
+            EmptyNormalizedKeyPolicy(),
+            TooLongNormalizedKeyPolicy(),
+            DefinitionFragmentNormalizedKeyPolicy(),
+            ForeignOriginalChangedPolicy(),
+        ]
+
+    def is_bad(self, original_key: str, normalized_key: str | None) -> bool:
+        return any(policy.is_bad(original_key, normalized_key) for policy in self.policies)
+
+
+class PostFilterNode:
+    def __init__(self, guard: NormalizedKeyGuard | None = None) -> None:
+        self.guard = guard or NormalizedKeyGuard()
+
+    def __call__(self, state: CorrectionState) -> CorrectionState:
+        suggestion = CorrectionSuggestion.model_validate(state["suggestion"])
+        if self.guard.is_bad(state["key"], suggestion.normalized_key) or suggestion.confidence <= 0:
+            suggestion.normalized_key = state["key"]
+            suggestion.normalized_value = None
+            if suggestion.strategy in {"corrector", "restorer"}:
+                suggestion.status = "unrecoverable"
+            suggestion.confidence = 0.0
+        return with_suggestion(state, suggestion)
+
+
+class CorrectionGraph:
+    """Pure correction graph. It does not know about SQLAlchemy, DB sessions or RAG storage."""
 
     def __init__(self) -> None:
-        self.rag = RagStore()
         self.orchestrator = CorrectionOrchestratorAgent()
-        self.corrector = LightOCRCorrectorAgent()
-        self.restorer = DefinitionRestorerAgent()
+        self.operations: dict[CorrectionStrategy, CorrectionOperation] = {
+            "keep": KeepOperation(),
+            "skip": SkipOperation(),
+            "capitalizer": CapitalizerOperation(),
+            "corrector": LLMCorrectionOperation("corrector", "corrected", "agent.light_ocr_corrector", LightOCRCorrectorAgent()),
+            "restorer": LLMCorrectionOperation("restorer", "restored", "agent.definition_restorer", DefinitionRestorerAgent()),
+        }
         self.graph = self._build_graph()
 
-    def normalize_item(self, db: Session, item: ExtractedItem) -> CorrectionSuggestion:
-        state = _state_from_item(item)
-        state["rag_matches"] = self._retrieve_matches(db, item)
+    def run(self, state: CorrectionState) -> CorrectionSuggestion:
         result = self.graph.invoke(state, config={"recursion_limit": 20})
-        suggestion = CorrectionSuggestion.model_validate(result["suggestion"])
-        self._persist(db, item, suggestion, state.get("rag_matches", []))
-        self._apply(db, item, suggestion)
-        return suggestion
+        return CorrectionSuggestion.model_validate(result["suggestion"])
 
     def _build_graph(self):
         graph = StateGraph(CorrectionState)
-        graph.add_node("route", self._route_node)
-        graph.add_node("keep", self._keep_node)
-        graph.add_node("capitalizer", self._capitalizer_node)
-        graph.add_node("corrector", self._corrector_node)
-        graph.add_node("restorer", self._restorer_node)
-        graph.add_node("skip", self._skip_node)
-        graph.add_node("post_filter", self._post_filter_node)
+        graph.add_node("route", RouteNode(self.orchestrator))
+        for strategy, operation in self.operations.items():
+            graph.add_node(strategy, CorrectionActionNode(operation))
+        graph.add_node("post_filter", PostFilterNode())
         graph.set_entry_point("route")
-        graph.add_conditional_edges("route", _route_key, {
+        graph.add_conditional_edges("route", route_key, {
             "keep": "keep",
             "capitalizer": "capitalizer",
             "corrector": "corrector",
             "restorer": "restorer",
             "skip": "skip",
         })
-        for node in ("keep", "capitalizer", "corrector", "restorer", "skip"):
-            graph.add_edge(node, "post_filter")
+        for strategy in self.operations:
+            graph.add_edge(strategy, "post_filter")
         graph.add_edge("post_filter", END)
         return graph.compile()
 
-    def _retrieve_matches(self, db: Session, item: ExtractedItem) -> list[dict[str, Any]]:
-        if not settings.enable_rag_validation:
-            return []
-        with AgentTimer("rag.retrieve_for_correction", document_id=item.document_id, item_id=item.id, key=item.key, top_k=settings.rag_top_k) as trace:
-            matches = self.rag.retrieve(db, f"{item.key}\n{item.value}\n{item.source_text or ''}", settings.rag_top_k)
-            trace.set(matches_count=len(matches), best_score=matches[0].score if matches else None)
-        return _matches_payload(matches)
 
-    def _route_node(self, state: CorrectionState) -> CorrectionState:
-        with AgentTimer("agent.correction_orchestrator", document_id=state["document_id"], item_id=state["item_id"], key=state["key"], model=settings.llm_model) as trace:
-            route = self.orchestrator.choose(_candidate_payload(state), state.get("rag_matches", []))
-            trace.set(selected_strategy=route.strategy, confidence=route.confidence, reason=route.reason[:240])
-        return {**state, "route": route.model_dump()}
+def deterministic_route(key: str) -> CorrectionRoute | None:
+    """Compatibility helper for tests/old callers.
 
-    def _keep_node(self, state: CorrectionState) -> CorrectionState:
-        route = CorrectionRoute.model_validate(state["route"])
-        return _with_suggestion(state, CorrectionSuggestion(normalized_key=state["key"], normalized_value=None, confidence=0.0, reason=route.reason, strategy="keep", status="kept", orchestrator_reason=route.reason))
-
-    def _skip_node(self, state: CorrectionState) -> CorrectionState:
-        route = CorrectionRoute.model_validate(state["route"])
-        return _with_suggestion(state, CorrectionSuggestion(normalized_key=state["key"], normalized_value=None, confidence=0.0, reason=route.reason, strategy="skip", status="skipped", orchestrator_reason=route.reason))
-
-    def _capitalizer_node(self, state: CorrectionState) -> CorrectionState:
-        route = CorrectionRoute.model_validate(state["route"])
-        normalized = titlecase_cyrillic_caps(state["key"])
-        status = "capitalized" if normalized != state["key"] else "kept"
-        return _with_suggestion(state, CorrectionSuggestion(normalized_key=normalized, normalized_value=None, confidence=0.75 if normalized != state["key"] else 0.0, reason=route.reason, strategy="capitalizer", status=status, orchestrator_reason=route.reason))
-
-    def _corrector_node(self, state: CorrectionState) -> CorrectionState:
-        route = CorrectionRoute.model_validate(state["route"])
-        try:
-            suggestion = self.corrector.correct(state)
-            suggestion.orchestrator_reason = route.reason
-        except Exception as exc:
-            suggestion = CorrectionSuggestion(normalized_key=state["key"], normalized_value=None, confidence=0.0, reason=f"Ошибка corrector: {exc}", strategy="corrector", status="unrecoverable", orchestrator_reason=route.reason)
-        return _with_suggestion(state, suggestion)
-
-    def _restorer_node(self, state: CorrectionState) -> CorrectionState:
-        route = CorrectionRoute.model_validate(state["route"])
-        try:
-            suggestion = self.restorer.restore(state)
-            suggestion.orchestrator_reason = route.reason
-        except Exception as exc:
-            suggestion = CorrectionSuggestion(normalized_key=state["key"], normalized_value=None, confidence=0.0, reason=f"Ошибка restorer: {exc}", strategy="restorer", status="unrecoverable", orchestrator_reason=route.reason)
-        return _with_suggestion(state, suggestion)
-
-    def _post_filter_node(self, state: CorrectionState) -> CorrectionState:
-        suggestion = CorrectionSuggestion.model_validate(state["suggestion"])
-        if _bad_normalized_key(state["key"], suggestion.normalized_key) or suggestion.confidence <= 0:
-            suggestion.normalized_key = state["key"]
-            suggestion.normalized_value = None
-            if suggestion.strategy in {"corrector", "restorer"}:
-                suggestion.status = "unrecoverable"
-            suggestion.confidence = 0.0
-        return _with_suggestion(state, suggestion)
-
-    def _persist(self, db: Session, item: ExtractedItem, suggestion: CorrectionSuggestion, matches: list[dict[str, Any]]) -> None:
-        db.add(ItemValidation(
-            item_id=item.id,
-            document_id=item.document_id,
-            agent_name="langgraph_ocr_correction_workflow",
-            decision=suggestion.status,
-            confidence=suggestion.confidence,
-            reason=suggestion.reason,
-            normalized_key=suggestion.normalized_key,
-            normalized_value=suggestion.normalized_value,
-            rag_evidence={"matches": matches},
-            payload={"key": item.key, "value": item.value, "strategy": suggestion.strategy, "orchestrator_reason": suggestion.orchestrator_reason},
-        ))
-        db.commit()
-
-    def _apply(self, db: Session, item: ExtractedItem, suggestion: CorrectionSuggestion) -> None:
-        item.normalized_key = suggestion.normalized_key
-        item.normalized_value = suggestion.normalized_value
-        item.correction_confidence = suggestion.confidence
-        item.correction_reason = suggestion.reason
-        item.correction_strategy = suggestion.strategy
-        item.correction_status = suggestion.status
-        item.correction_orchestrator_reason = suggestion.orchestrator_reason
-        if item.status == "auto" and suggestion.confidence < 0.85:
-            item.status = "needs_review"
-        db.commit()
+    New code should compose CorrectionRoutingPolicy objects instead of calling
+    text predicate helpers directly.
+    """
+    ctx = CorrectionRoutingContext(key=(key or "").strip(), candidate={"key": key}, matches=[])
+    for policy in [
+        TextRoutePolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+        TextRoutePolicy(CLEAN_CYRILLIC_CAPS_TEXT_POLICY, "capitalizer", 0.85),
+        TextRoutePolicy(CLEAN_RUSSIAN_TERM_TEXT_POLICY, "keep", 0.9),
+    ]:
+        route = policy.choose(ctx)
+        if route is not None:
+            return route
+    return None
 
 
-def _route_key(state: CorrectionState) -> str:
+def safety_net_route(key: str, route: CorrectionRoute) -> CorrectionRoute:
+    """Compatibility helper for tests/old callers.
+
+    New code should use CorrectionRouteAdjustmentPolicy composition.
+    """
+    ctx = CorrectionRoutingContext(key=(key or "").strip(), candidate={"key": key}, matches=[])
+    for policy in [
+        ForceTextRouteAdjustmentPolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+        RejectBadCapitalizerPolicy(),
+        RejectActiveCorrectionForCleanRussianPolicy(),
+    ]:
+        route = policy.adjust(ctx, route)
+    return route
+
+
+def normalize_strategy(value: Any) -> CorrectionStrategy:
+    strategy = str(value or "skip").strip().lower()
+    aliases = {"no_correction": "keep", "unchanged": "keep", "as_is": "keep", "restore": "restorer", "correction": "corrector"}
+    strategy = aliases.get(strategy, strategy)
+    return strategy if strategy in {"keep", "capitalizer", "corrector", "restorer", "skip"} else "skip"  # type: ignore[return-value]
+
+
+def route_key(state: CorrectionState) -> str:
     route = state.get("route") or {}
-    strategy = str(route.get("strategy") or "skip")
-    return strategy if strategy in {"keep", "capitalizer", "corrector", "restorer", "skip"} else "skip"
+    return normalize_strategy(route.get("strategy"))
 
 
-def _state_from_item(item: ExtractedItem) -> CorrectionState:
-    return {
-        "item_id": item.id,
-        "document_id": item.document_id,
-        "key": item.key,
-        "value": item.value,
-        "source_text": item.source_text,
-        "page_from": item.page_from,
-        "page_to": item.page_to,
-        "confidence": item.confidence,
-        "status": item.status,
-    }
-
-
-def _candidate_payload(state: CorrectionState) -> dict[str, Any]:
+def candidate_payload(state: CorrectionState) -> dict[str, Any]:
     return {k: state.get(k) for k in ("key", "value", "source_text", "page_from", "page_to", "confidence", "status")}
 
 
-def _with_suggestion(state: CorrectionState, suggestion: CorrectionSuggestion) -> CorrectionState:
+def with_suggestion(state: CorrectionState, suggestion: CorrectionSuggestion) -> CorrectionState:
     return {**state, "suggestion": suggestion.model_dump()}
 
 
-def _suggestion_from_data(data: dict[str, Any], state: CorrectionState, strategy: str, status: str) -> CorrectionSuggestion:
-    normalized_key = str(data.get("normalized_key") or state["key"]).strip() or state["key"]
-    confidence = clamp_float(data.get("confidence"), default=0.0)
-    if normalized_key == state["key"]:
-        confidence = 0.0
-        status = "unrecoverable" if strategy == "restorer" else "unchanged"
-    return CorrectionSuggestion(
-        normalized_key=normalized_key,
-        normalized_value=clean_optional_text(data.get("normalized_value")),
-        confidence=confidence,
-        reason=str(data.get("reason") or f"{strategy} suggestion"),
-        strategy=strategy,
-        status=status,
-    )
-
-
-def _bad_normalized_key(original_key: str, normalized_key: str | None) -> bool:
-    if not normalized_key or not normalized_key.strip():
-        return True
-    nk = normalized_key.strip()
-    if len(nk) > 100 or len(nk.split()) > 8:
-        return True
-    definition_fragments = ("представляет собой", "образуется", "содержит", "является", "под ними", "вследствие")
-    if any(fragment in nk.lower() for fragment in definition_fragments):
-        return True
-    if looks_latin_or_foreign(original_key) and original_key.strip() != nk:
-        return True
-    return False
-
-
-def _matches_payload(matches: list[RagMatch]) -> list[dict[str, Any]]:
-    return [
-        {"term": m.term, "definition": m.definition[:400], "score": m.score, "source_item_id": m.source_item_id}
-        for m in matches
-    ]
+def bad_normalized_key(original_key: str, normalized_key: str | None) -> bool:
+    """Compatibility wrapper around NormalizedKeyGuard policy composition."""
+    return NormalizedKeyGuard().is_bad(original_key, normalized_key)

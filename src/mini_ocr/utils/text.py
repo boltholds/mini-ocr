@@ -37,65 +37,33 @@ def letter_stats(text: str | None) -> tuple[int, int, int]:
 
 
 def has_mixed_cyrillic_latin(text: str | None) -> bool:
-    _, cyr, lat = letter_stats(text)
-    return cyr > 0 and lat > 0
+    from mini_ocr.services.policies.text import MIXED_CYRILLIC_LATIN_TEXT_POLICY
+
+    return MIXED_CYRILLIC_LATIN_TEXT_POLICY.matches(text)
 
 
 def looks_latin_or_foreign(text: str | None) -> bool:
-    stripped = compact(text)
-    letters, cyr, lat = letter_stats(stripped)
-    if not letters:
-        return False
-    if lat > 0 and cyr == 0:
-        return True
-    return bool(FOREIGN_DOT_ALIAS_RE.match(stripped))
+    from mini_ocr.services.policies.text import LATIN_OR_FOREIGN_TEXT_POLICY
+
+    return LATIN_OR_FOREIGN_TEXT_POLICY.matches(text)
 
 
 def is_clean_cyrillic_caps(text: str | None) -> bool:
-    stripped = compact(text)
-    letters, cyr, lat = letter_stats(stripped)
-    if letters == 0 or lat > 0:
-        return False
-    if cyr / max(letters, 1) < 0.9:
-        return False
-    if any(ch.isdigit() for ch in stripped):
-        return False
-    allowed_punct = set(" -().,/№«»\"'")
-    if any((not ch.isalnum()) and (ch not in allowed_punct) for ch in stripped):
-        return False
-    return sum(ch.isupper() for ch in stripped if ch.isalpha()) / max(letters, 1) >= 0.85
+    from mini_ocr.services.policies.text import CLEAN_CYRILLIC_CAPS_TEXT_POLICY
+
+    return CLEAN_CYRILLIC_CAPS_TEXT_POLICY.matches(text)
 
 
 def looks_clean_russian_term(text: str | None) -> bool:
-    stripped = compact(text)
-    if not stripped:
-        return False
-    letters, cyr, lat = letter_stats(stripped)
-    if letters == 0 or lat > 0:
-        return False
-    if cyr / max(letters, 1) < 0.85:
-        return False
-    if len(stripped.split()) > 8:
-        return False
-    if is_clean_cyrillic_caps(stripped):
-        return False
-    if re.search(r"[@#$%^*_+=<>|]", stripped):
-        return False
-    return True
+    from mini_ocr.services.policies.text import CLEAN_RUSSIAN_TERM_TEXT_POLICY
+
+    return CLEAN_RUSSIAN_TERM_TEXT_POLICY.matches(text)
 
 
 def looks_ocr_noisy(text: str | None) -> bool:
-    stripped = compact(text)
-    if not stripped:
-        return True
-    letters, cyr, lat = letter_stats(stripped)
-    if letters == 0:
-        return True
-    if cyr > 0 and lat > 0:
-        return True
-    upper_ratio = sum(ch.isupper() for ch in stripped if ch.isalpha()) / max(letters, 1)
-    weird = sum(ch.isdigit() or ch in "@#$%^*_+=<>|/" for ch in stripped)
-    return upper_ratio > 0.75 or weird >= 2 or ("-" in stripped and len(stripped) <= 12)
+    from mini_ocr.services.policies.text import OCR_NOISY_TEXT_POLICY
+
+    return OCR_NOISY_TEXT_POLICY.matches(text)
 
 
 def titlecase_cyrillic_caps(text: str) -> str:
