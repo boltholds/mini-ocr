@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, StateGraph
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,7 @@ from mini_ocr.models import Document, ExtractedItem, ExtractionJob
 from mini_ocr.schemas.extraction import ExtractedEntity
 from mini_ocr.services.correction_service import OCRCorrectionWorkflow
 from mini_ocr.services.agents.extraction import ExtractionAgent
-from mini_ocr.services.agents.validation import CandidateValidationAgent
+from mini_ocr.services.validation_service import CandidateValidationService
 from mini_ocr.services.extraction_validator import ExtractionValidator
 from mini_ocr.services.hash_utils import sha256_text
 from mini_ocr.services.observability import AgentTimer, get_logger
@@ -53,7 +53,7 @@ class WorkflowServices:
     extractor: ExtractionAgent
     validator: ExtractionValidator
     corrector: OCRCorrectionWorkflow | None
-    validation_agent: CandidateValidationAgent | None
+    validation_agent: CandidateValidationService | None
     logger: Any
 
 
@@ -77,7 +77,7 @@ class LangGraphExtractionWorkflow:
             extractor=ExtractionAgent(),
             validator=ExtractionValidator(),
             corrector=OCRCorrectionWorkflow() if settings.enable_ocr_correction_agent else None,
-            validation_agent=CandidateValidationAgent() if settings.enable_agent_validation else None,
+            validation_agent=CandidateValidationService() if settings.enable_agent_validation else None,
             logger=get_logger("langgraph_workflow"),
         )
         self.graph = self._build_graph()

@@ -351,25 +351,9 @@ class LLMCorrectionOperation:
 
     def suggest(self, state: CorrectionState, route: CorrectionRoute) -> CorrectionSuggestion:
         data = self.agent.invoke(state)
-        suggestion = self.suggestion_from_data(data, state, self.strategy, self.status)
+        suggestion = suggestion_from_data(data, state, self.strategy, self.status)
         suggestion.orchestrator_reason = route.reason
         return suggestion
-    
-    def suggestion_from_data(self, data: dict[str, Any], state: CorrectionState, strategy: CorrectionStrategy, status: str) -> CorrectionSuggestion:
-        normalized_key = str(data.get("normalized_key") or state["key"]).strip() or state["key"]
-        confidence = clamp_float(data.get("confidence"), default=0.0)
-        if normalized_key == state["key"]:
-            confidence = 0.0
-            status = "unrecoverable" if strategy == "restorer" else "unchanged"
-        return CorrectionSuggestion(
-            normalized_key=normalized_key,
-            normalized_value=clean_optional_text(data.get("normalized_value")),
-            confidence=confidence,
-            reason=str(data.get("reason") or f"{strategy} suggestion"),
-            strategy=strategy,
-            status=status,
-        )
-
 
 
 class RouteNode:
@@ -400,20 +384,9 @@ class CorrectionActionNode:
             try:
                 suggestion = self.operation.suggest(state, route)
             except Exception as exc:
-                suggestion = self.failed_suggestion(state, self.operation.strategy, route.reason, exc)
+                suggestion = failed_suggestion(state, self.operation.strategy, route.reason, exc)
             trace.set(normalized_key=suggestion.normalized_key, correction_confidence=suggestion.confidence, status=suggestion.status)
         return with_suggestion(state, suggestion)
-    
-    def failed_suggestion(self, state: CorrectionState, strategy: CorrectionStrategy, orchestrator_reason: str | None, exc: Exception) -> CorrectionSuggestion:
-        return CorrectionSuggestion(
-            normalized_key=state["key"],
-            normalized_value=None,
-            confidence=0.0,
-            reason=f"Ошибка {strategy}: {exc}",
-            strategy=strategy,
-            status="unrecoverable" if strategy in {"corrector", "restorer"} else "skipped",
-            orchestrator_reason=orchestrator_reason,
-        )
 
 
 class NormalizedKeyPolicy(Protocol):
@@ -519,6 +492,9 @@ class CorrectionGraph:
         return graph.compile()
 
 
+
+
+
 def deterministic_route(key: str) -> CorrectionRoute | None:
     """Compatibility helper for tests/old callers.
 
@@ -570,6 +546,34 @@ def candidate_payload(state: CorrectionState) -> dict[str, Any]:
 
 def with_suggestion(state: CorrectionState, suggestion: CorrectionSuggestion) -> CorrectionState:
     return {**state, "suggestion": suggestion.model_dump()}
+
+
+def suggestion_from_data(data: dict[str, Any], state: CorrectionState, strategy: CorrectionStrategy, status: str) -> CorrectionSuggestion:
+    normalized_key = str(data.get("normalized_key") or state["key"]).strip() or state["key"]
+    confidence = clamp_float(data.get("confidence"), default=0.0)
+    if normalized_key == state["key"]:
+        confidence = 0.0
+        status = "unrecoverable" if strategy == "restorer" else "unchanged"
+    return CorrectionSuggestion(
+        normalized_key=normalized_key,
+        normalized_value=clean_optional_text(data.get("normalized_value")),
+        confidence=confidence,
+        reason=str(data.get("reason") or f"{strategy} suggestion"),
+        strategy=strategy,
+        status=status,
+    )
+
+
+def failed_suggestion(state: CorrectionState, strategy: CorrectionStrategy, orchestrator_reason: str | None, exc: Exception) -> CorrectionSuggestion:
+    return CorrectionSuggestion(
+        normalized_key=state["key"],
+        normalized_value=None,
+        confidence=0.0,
+        reason=f"Ошибка {strategy}: {exc}",
+        strategy=strategy,
+        status="unrecoverable" if strategy in {"corrector", "restorer"} else "skipped",
+        orchestrator_reason=orchestrator_reason,
+    )
 
 
 def bad_normalized_key(original_key: str, normalized_key: str | None) -> bool:

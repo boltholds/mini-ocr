@@ -1,13 +1,18 @@
-from mini_ocr.services.agents.correction import CorrectionRoute, CorrectionSuggestion
-from mini_ocr.services.correction_service import OCRCorrectionWorkflow
-from mini_ocr.services.agents.extraction import ExtractionAgent
-from mini_ocr.services.agents.validation import CandidateValidationAgent, ValidationDecision
+"""Agent-layer exports.
+
+Keep this module lightweight: some tests import validation-only classes in an
+environment where optional LangChain/LangGraph runtime dependencies are not
+installed. Heavy agent modules should be imported directly by production code.
+"""
+
+from mini_ocr.services.validation_models import (
+    RagEvidence,
+    ValidationCandidate,
+    ValidationDecision,
+)
 
 __all__ = [
-    "CorrectionRoute",
-    "CorrectionSuggestion",
-    "OCRCorrectionWorkflow",
-    "ExtractionAgent",
-    "CandidateValidationAgent",
     "ValidationDecision",
+    "ValidationCandidate",
+    "RagEvidence",
 ]
