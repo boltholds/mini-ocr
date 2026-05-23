@@ -20,6 +20,10 @@ class ExtractedItem(Base):
     page_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
     page_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    normalized_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalized_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    correction_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    correction_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="auto")  # auto | needs_review | approved | rejected
     extractor: Mapped[str] = mapped_column(String(32), default="llm")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

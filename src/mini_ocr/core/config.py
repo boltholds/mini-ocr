@@ -16,12 +16,19 @@ class Settings(BaseSettings):
     enable_llm_validation: bool = False
     enable_regex_fallback: bool = False
 
+    # LangGraph orchestrates LLM extraction, RAG validation and status decisions.
+    enable_langgraph_workflow: bool = True
+    enable_agent_validation: bool = True
+    enable_ocr_correction_agent: bool = True
+    enable_rag_validation: bool = True
+    rag_top_k: int = 5
+
     # Supported: openai-compatible, ollama
     llm_provider: str = "ollama"
     llm_base_url: str | None = "http://localhost:11434/v1"
     llm_api_key: str | None = "ollama"
     llm_model: str = "gemma3:1b"
-    prompt_version: str = "terms_abbrev_extractor_v2"
+    prompt_version: str = "terms_abbrev_extractor_v5_correction_agent"
 
     class Config:
         env_file = ".env"

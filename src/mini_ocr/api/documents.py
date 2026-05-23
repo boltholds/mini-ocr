@@ -4,10 +4,11 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from mini_ocr.core.db import get_db
-from mini_ocr.models import Document, DocumentPage, ExtractedItem, PageAnalysis
-from mini_ocr.schemas.document import DocumentOut, ItemOut
+from mini_ocr.models import Document, DocumentPage, ExtractedItem, PageAnalysis, ItemValidation, TermKnowledgeEntry
+from mini_ocr.schemas.document import DocumentOut, ItemOut, ValidationOut, KnowledgeEntryOut
 from mini_ocr.services.pipeline import ProcessingPipeline
 from mini_ocr.services.section_detector import PageText, SectionDetector
+from mini_ocr.services.rag_store import RagStore
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -148,3 +149,44 @@ def get_items_by_title(title: str, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
     return db.query(ExtractedItem).filter(ExtractedItem.document_id == document.id).all()
+
+
+@router.get("/items/{item_id}/validations", response_model=list[ValidationOut])
+def get_item_validations(item_id: str, db: Session = Depends(get_db)):
+    item = db.get(ExtractedItem, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return (
+        db.query(ItemValidation)
+        .filter(ItemValidation.item_id == item_id)
+        .order_by(ItemValidation.created_at.desc())
+        .all()
+    )
+
+
+@router.patch("/items/{item_id}/approve", response_model=ItemOut)
+def approve_item(item_id: str, db: Session = Depends(get_db)):
+    item = db.get(ExtractedItem, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    item.status = "approved"
+    db.commit()
+    db.refresh(item)
+    RagStore().add_confirmed_item(db, item, status="approved")
+    return item
+
+
+@router.patch("/items/{item_id}/reject", response_model=ItemOut)
+def reject_item(item_id: str, db: Session = Depends(get_db)):
+    item = db.get(ExtractedItem, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    item.status = "rejected"
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@router.get("/kb/terms", response_model=list[KnowledgeEntryOut])
+def get_knowledge_base(limit: int = Query(default=50, ge=1, le=500), db: Session = Depends(get_db)):
+    return db.query(TermKnowledgeEntry).order_by(TermKnowledgeEntry.created_at.desc()).limit(limit).all()

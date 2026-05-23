@@ -29,6 +29,9 @@ PAGE_NOISE = (
     "группа",
 )
 
+FOREIGN_ALIAS_RE = re.compile(r"^[A-ZА-Я]?\s*[A-Z]\.\s+[A-Za-z].+")
+MIXED_GARBAGE_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d)(?=.*[-_/]).{5,}$")
+
 ABBR_RE = re.compile(r"^[A-ZА-ЯЁ0-9][A-ZА-ЯЁ0-9./-]{1,14}$")
 
 
@@ -107,8 +110,15 @@ class ExtractionValidator:
             return ValidationDecision(False, 0.0, "rejected", "service phrase is not a term")
         if any(bad in value_lower for bad in BAD_VALUE_FRAGMENTS) and len(value.split()) <= 4:
             return ValidationDecision(False, 0.0, "rejected", "service value is not a definition")
+        # Old scans often confuse Cyrillic with Latin-looking glyphs. Do not
+        # drop these candidates here; keep them for agentic/RAG validation and
+        # human review, but lower confidence.
+        if _looks_like_foreign_alias(key):
+            confidence = min(confidence, 0.49)
+        if _looks_like_ocr_garbage_key(key):
+            confidence = min(confidence, 0.49)
         if _looks_like_noise(key):
-            return ValidationDecision(False, 0.0, "rejected", "noise-like term key")
+            confidence = min(confidence, 0.49)
         if key.lower() not in source.lower():
             confidence = min(confidence, 0.7)
         if value.lower() not in source.lower():
@@ -151,3 +161,40 @@ def _best_similarity(needle: str, haystack: str) -> float:
         window = haystack[max(0, pos - 30): pos + window_size]
         best = max(best, SequenceMatcher(None, needle, window).ratio())
     return best
+
+
+def _looks_like_foreign_alias(text: str) -> bool:
+    # Tables in standards may contain English/German/French aliases. They are
+    # useful as aliases, but they should not become the primary Russian term.
+    return bool(FOREIGN_ALIAS_RE.match(text.strip()))
+
+
+def _looks_like_ocr_garbage_key(text: str) -> bool:
+    stripped = text.strip()
+    if MIXED_GARBAGE_RE.match(stripped):
+        return True
+
+    letters = [ch for ch in stripped if ch.isalpha()]
+    if not letters:
+        return True
+
+    cyr = sum("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in letters)
+    latin = sum(ch.isascii() and ch.isalpha() for ch in letters)
+
+    # Russian OCR mode: a long mostly-latin key is usually an alias or garbage.
+    if latin > cyr and len(stripped) > 5:
+        return True
+
+    upper_ratio = sum(ch.isupper() for ch in letters) / max(len(letters), 1)
+    if upper_ratio > 0.85 and len(stripped) > 8:
+        # Keep simple all-caps Russian one-word terms only if they are clean Cyrillic.
+        if cyr / max(len(letters), 1) < 0.8:
+            return True
+        if any(ch.isdigit() for ch in stripped) or "-" in stripped:
+            return True
+
+    weird = sum(1 for ch in stripped if not (ch.isalnum() or ch.isspace() or ch in "-().,/:;№\"'«»"))
+    if weird >= 2:
+        return True
+
+    return False

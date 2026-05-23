@@ -9,9 +9,7 @@ from mini_ocr.services.pdf_renderer import PDFRenderer
 from mini_ocr.services.image_preprocessor import ImagePreprocessor
 from mini_ocr.services.ocr.paddleocr_service import PaddleOCRService
 from mini_ocr.services.section_detector import SectionDetector, PageText
-from mini_ocr.services.llm.extractor import HybridExtractor
-from mini_ocr.schemas.extraction import ExtractionResult
-from mini_ocr.services.extraction_validator import ExtractionValidator
+from mini_ocr.services.langgraph_workflow import LangGraphExtractionWorkflow
 
 
 class ProcessingPipeline:
@@ -20,8 +18,6 @@ class ProcessingPipeline:
         self.preprocessor = ImagePreprocessor()
         self.ocr = PaddleOCRService()
         self.detector = SectionDetector()
-        self.extractor = HybridExtractor()
-        self.validator = ExtractionValidator()
 
     def register_document(self, db: Session, src_path: Path, title: str | None = None) -> Document:
         file_hash = sha256_file(src_path)
@@ -97,14 +93,40 @@ class ProcessingPipeline:
             raise
 
     def _render_pages(self, db: Session, document: Document) -> None:
-        existing_count = db.query(DocumentPage).filter_by(document_id=document.id).count()
-        if existing_count > 0:
-            return
         pdf_path = Path(document.file_path)
         image_dir = settings.storage_dir / document.file_hash / "pages"
-        image_paths = self.renderer.render(pdf_path, image_dir)
+        expected_count = self.renderer.page_count(pdf_path)
+
+        existing_pages = (
+            db.query(DocumentPage)
+            .filter_by(document_id=document.id)
+            .order_by(DocumentPage.page_number)
+            .all()
+        )
+        existing_count = len(existing_pages)
+        max_existing_page = max((p.page_number for p in existing_pages), default=0)
+        all_images_exist = all(p.image_path and Path(p.image_path).exists() for p in existing_pages)
+
+        # Do not trust stale page rows. During development or after renderer changes,
+        # an old DB state can contain page_number values that do not belong to the
+        # current PDF. That later produces impossible page ranges like 30-32 in a
+        # 20-page document. Re-render if DB rows do not match the real PDF page count.
+        if existing_count == expected_count and max_existing_page == expected_count and all_images_exist:
+            return
+
+        db.query(OCRBlock).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.query(PageAnalysis).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.query(ExtractionJob).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.query(ExtractedItem).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.query(DocumentPage).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.commit()
+
+        image_paths = self.renderer.render(pdf_path, image_dir, force=True)
         if not image_paths:
             raise RuntimeError("PDF renderer produced no page images")
+        if len(image_paths) != expected_count:
+            raise RuntimeError(f"PDF renderer produced {len(image_paths)} images, expected {expected_count}")
+
         for idx, image_path in enumerate(image_paths, start=1):
             db.add(DocumentPage(document_id=document.id, page_number=idx, image_path=str(image_path)))
         db.commit()
@@ -167,6 +189,21 @@ class ProcessingPipeline:
             .order_by(DocumentPage.page_number)
             .all()
         )
+        if not pages:
+            document.error_message = "No OCR pages available for extraction"
+            db.commit()
+            return
+
+        # Re-run means replace extraction/validation output, but keep OCR cache.
+        from mini_ocr.models import ItemValidation
+        db.query(ItemValidation).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.query(ExtractionJob).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.query(ExtractedItem).filter_by(document_id=document.id).delete(synchronize_session=False)
+        db.commit()
+
+        valid_page_numbers = {p.page_number for p in pages}
+        max_page_number = max(valid_page_numbers)
+
         page_texts = []
         for p in pages:
             analysis = db.query(PageAnalysis).filter_by(page_id=p.id).first()
@@ -176,89 +213,27 @@ class ProcessingPipeline:
                 layout_type=analysis.layout_type if analysis else None,
                 ocr_score=analysis.ocr_score if analysis else None,
             ))
+
         candidates = self.detector.detect(page_texts)
+        candidates = [
+            c for c in candidates
+            if c.page_from in valid_page_numbers
+            and c.page_to in valid_page_numbers
+            and c.page_from <= c.page_to <= max_page_number
+        ]
         if not candidates:
             document.error_message = "No target sections found"
             db.commit()
             return
 
-        for candidate in candidates:
-            input_hash = sha256_text(candidate.text + settings.prompt_version + settings.llm_model)
-            job = (
-                db.query(ExtractionJob)
-                .filter_by(
-                    document_id=document.id,
-                    section_type=candidate.section_type,
-                    input_text_hash=input_hash,
-                    prompt_version=settings.prompt_version,
-                    model_name=settings.llm_model,
-                )
-                .first()
-            )
-            if job and job.status == "done":
-                continue
-            if job is None:
-                job = ExtractionJob(
-                    document_id=document.id,
-                    section_type=candidate.section_type,
-                    page_from=candidate.page_from,
-                    page_to=candidate.page_to,
-                    input_text_hash=input_hash,
-                    prompt_version=settings.prompt_version,
-                    model_name=settings.llm_model,
-                    status="running",
-                )
-                db.add(job)
-            else:
-                job.status = "running"
-            db.commit()
-
-            try:
-                result = self.extractor.extract(candidate.text)
-                self._save_result(db, document, result, candidate.page_from, candidate.page_to, candidate.section_type, candidate.text)
-                job.status = "done"
-                job.error_message = None
+        if settings.enable_langgraph_workflow:
+            workflow = LangGraphExtractionWorkflow(db, document)
+            state = workflow.run(candidates)
+            if state.get("errors"):
+                document.error_message = "; ".join(state["errors"][:3])
                 db.commit()
-            except Exception as exc:
-                job.status = "failed"
-                job.error_message = str(exc)
-                db.commit()
+            return
 
-    def _save_result(
-        self,
-        db: Session,
-        document: Document,
-        result: ExtractionResult,
-        page_from: int,
-        page_to: int,
-        section_type: str,
-        chunk_text: str,
-    ) -> None:
-        allowed_types = {"abbreviations": {"abbreviation"}, "terms": {"term"}, "mixed": {"abbreviation", "term"}}
-        allowed = allowed_types.get(section_type, {"abbreviation", "term"})
-
-        for item_type, entities in (("abbreviation", result.abbreviations), ("term", result.terms)):
-            if item_type not in allowed:
-                continue
-            for entity in entities:
-                decision = self.validator.validate(item_type, entity, chunk_text, section_type)
-                if not decision.keep:
-                    continue
-
-                row = ExtractedItem(
-                    document_id=document.id,
-                    item_type=item_type,
-                    key=entity.key.strip(),
-                    value=entity.value.strip(),
-                    source_text=(entity.source_text or "").strip() or None,
-                    page_from=page_from,
-                    page_to=page_to,
-                    confidence=decision.confidence,
-                    status=decision.status,
-                    extractor=getattr(self.extractor, "extractor_name", "unknown"),
-                )
-                db.add(row)
-                try:
-                    db.commit()
-                except IntegrityError:
-                    db.rollback()
+        # LangGraph is the default path. This branch is kept only as a clear
+        # configuration failure instead of silently returning old behavior.
+        raise RuntimeError("ENABLE_LANGGRAPH_WORKFLOW=false is not supported in this build")
