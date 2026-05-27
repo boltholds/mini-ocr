@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypedDict
 
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
@@ -12,11 +10,12 @@ from pydantic import BaseModel, Field
 from mini_ocr.core.config import settings
 from mini_ocr.services.llm.client import build_chat_model
 from mini_ocr.services.observability import AgentTimer
-from mini_ocr.utils.json_utils import loads_json_relaxed
 from mini_ocr.services.policies.text import (
     CLEAN_CYRILLIC_CAPS_TEXT_POLICY,
     CLEAN_RUSSIAN_TERM_TEXT_POLICY,
+    CYRILLIC_ABBREVIATION_TEXT_POLICY,
     LATIN_OR_FOREIGN_TEXT_POLICY,
+    SERVICE_HEADING_TEXT_POLICY,
     TextPolicy,
 )
 from mini_ocr.utils.text import clean_optional_text, clamp_float, titlecase_cyrillic_caps
@@ -39,6 +38,19 @@ class CorrectionSuggestion(BaseModel):
     strategy: CorrectionStrategy
     status: str
     orchestrator_reason: str | None = None
+
+
+class CorrectionAgentOutput(BaseModel):
+    """Structured output returned by LLM correction agents.
+
+    Strategy/status are attached by the operation that invoked the agent; the
+    LLM only proposes the normalized fields and confidence.
+    """
+
+    normalized_key: str
+    normalized_value: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str
 
 
 class CorrectionState(TypedDict, total=False):
@@ -99,16 +111,16 @@ class LLMRoutingPolicy:
         self.chain = chain
 
     def choose(self, ctx: CorrectionRoutingContext) -> CorrectionRoute | None:
-        content = self.chain.invoke({
-            "candidate_json": json.dumps(ctx.candidate, ensure_ascii=False),
-            "rag_json": json.dumps(ctx.matches, ensure_ascii=False),
+        route = self.chain.invoke({
+            "candidate": ctx.candidate,
+            "rag_matches": ctx.matches,
         })
-        data = loads_json_relaxed(content)
-        return CorrectionRoute.model_validate({
-            "strategy": normalize_strategy(data.get("strategy")),
-            "confidence": clamp_float(data.get("confidence"), default=0.5),
-            "reason": str(data.get("reason") or "Маршрут выбран агентом."),
-        })
+        route = CorrectionRoute.model_validate(route)
+        return CorrectionRoute(
+            strategy=normalize_strategy(route.strategy),
+            confidence=route.confidence,
+            reason=route.reason or "Маршрут выбран агентом.",
+        )
 
 
 @dataclass(frozen=True)
@@ -188,12 +200,16 @@ def default_correction_routing_pipeline(chain: Any) -> CorrectionRoutingPipeline
     return CorrectionRoutingPipeline(
         pre_policies=[
             TextRoutePolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+            TextRoutePolicy(SERVICE_HEADING_TEXT_POLICY, "skip", 0.95),
+            TextRoutePolicy(CYRILLIC_ABBREVIATION_TEXT_POLICY, "keep", 0.95),
             TextRoutePolicy(CLEAN_CYRILLIC_CAPS_TEXT_POLICY, "capitalizer", 0.85),
             TextRoutePolicy(CLEAN_RUSSIAN_TERM_TEXT_POLICY, "keep", 0.9),
         ],
         llm_policy=LLMRoutingPolicy(chain),
         adjustment_policies=[
             ForceTextRouteAdjustmentPolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+            ForceTextRouteAdjustmentPolicy(SERVICE_HEADING_TEXT_POLICY, "skip", 0.95),
+            ForceTextRouteAdjustmentPolicy(CYRILLIC_ABBREVIATION_TEXT_POLICY, "keep", 0.95),
             RejectBadCapitalizerPolicy(),
             RejectActiveCorrectionForCleanRussianPolicy(),
         ],
@@ -223,19 +239,16 @@ class CorrectionOrchestratorAgent:
                 "Если сомневаешься между keep и corrector/restorer — выбирай keep. "
                 "Если сомневаешься между restorer и skip — выбирай skip. "
                 "Для EN, IDT, MOD и латинских терминов выбирай skip. "
-                "Верни только JSON без markdown. Причина на русском.",
+                "Причина должна быть на русском.",
             ),
             (
                 "human",
-                "Candidate JSON:\n{candidate_json}\n\n"
-                "RAG matches JSON:\n{rag_json}\n\n"
-                "Output schema:\n"
-                "{{\"strategy\": \"keep|capitalizer|corrector|restorer|skip\", "
-                "\"confidence\": 0.0, "
-                "\"reason\": \"краткая причина на русском\"}}",
+                "Candidate:\n{candidate}\n\n"
+                "RAG matches:\n{rag_matches}\n\n"
+                "Return a structured CorrectionRoute object.",
             ),
         ])
-        self.chain = self.prompt | self.llm | StrOutputParser()
+        self.chain = self.prompt | self.llm.with_structured_output(CorrectionRoute)
         self.routing = default_correction_routing_pipeline(self.chain)
 
     def choose(self, candidate: dict[str, Any], matches: list[dict[str, Any]]) -> CorrectionRoute:
@@ -248,7 +261,11 @@ class CorrectionOrchestratorAgent:
 
 
 class LLMCorrectionAgent:
-    """Base LLM action: prompt invocation and JSON parsing only."""
+    """Base LLM action using structured output.
+
+    The agent returns CorrectionAgentOutput directly. JSON parsing/repair belongs
+    neither here nor in graph nodes.
+    """
 
     def __init__(self, system_prompt: str) -> None:
         self.llm = build_chat_model()
@@ -256,28 +273,29 @@ class LLMCorrectionAgent:
             ("system", system_prompt),
             (
                 "human",
-                "Candidate JSON:\n{candidate_json}\n\nRAG matches JSON:\n{rag_json}\n\n"
-                "Output schema:\n{{\"normalized_key\": \"string\", \"normalized_value\": null, \"confidence\": 0.0, \"reason\": \"причина на русском\"}}",
+                "Candidate:\n{candidate}\n\n"
+                "RAG matches:\n{rag_matches}\n\n"
+                "Return a structured CorrectionAgentOutput object.",
             ),
         ])
-        self.chain = self.prompt | self.llm | StrOutputParser()
+        self.chain = self.prompt | self.llm.with_structured_output(CorrectionAgentOutput)
 
-    def invoke(self, state: CorrectionState) -> dict[str, Any]:
-        content = self.chain.invoke({
-            "candidate_json": json.dumps(candidate_payload(state), ensure_ascii=False),
-            "rag_json": json.dumps(state.get("rag_matches", []), ensure_ascii=False),
+    def invoke(self, state: CorrectionState) -> CorrectionAgentOutput:
+        output = self.chain.invoke({
+            "candidate": candidate_payload(state),
+            "rag_matches": state.get("rag_matches", []),
         })
-        return loads_json_relaxed(content)
+        return CorrectionAgentOutput.model_validate(output)
 
 
 class LightOCRCorrectorAgent(LLMCorrectionAgent):
     def __init__(self) -> None:
-        super().__init__("Ты исправляешь только лёгкие OCR-ошибки в ключе термина. Не восстанавливай по смыслу. Верни только JSON.")
+        super().__init__("Ты исправляешь только лёгкие OCR-ошибки в ключе термина. Не восстанавливай по смыслу. Верни структурированный ответ.")
 
 
 class DefinitionRestorerAgent(LLMCorrectionAgent):
     def __init__(self) -> None:
-        super().__init__("Ты осторожно восстанавливаешь сильно повреждённый OCR-ключ по определению и RAG. Если уверенности нет — верни исходный key и confidence 0. Верни только JSON.")
+        super().__init__("Ты осторожно восстанавливаешь сильно повреждённый OCR-ключ по определению и RAG. Если уверенности нет — верни исходный key и confidence 0. Верни структурированный ответ.")
 
 
 class CorrectionOperation(Protocol):
@@ -350,8 +368,8 @@ class LLMCorrectionOperation:
         self.agent = agent
 
     def suggest(self, state: CorrectionState, route: CorrectionRoute) -> CorrectionSuggestion:
-        data = self.agent.invoke(state)
-        suggestion = suggestion_from_data(data, state, self.strategy, self.status)
+        output = self.agent.invoke(state)
+        suggestion = suggestion_from_structured_output(output, state, self.strategy, self.status)
         suggestion.orchestrator_reason = route.reason
         return suggestion
 
@@ -492,9 +510,6 @@ class CorrectionGraph:
         return graph.compile()
 
 
-
-
-
 def deterministic_route(key: str) -> CorrectionRoute | None:
     """Compatibility helper for tests/old callers.
 
@@ -504,6 +519,8 @@ def deterministic_route(key: str) -> CorrectionRoute | None:
     ctx = CorrectionRoutingContext(key=(key or "").strip(), candidate={"key": key}, matches=[])
     for policy in [
         TextRoutePolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+        TextRoutePolicy(SERVICE_HEADING_TEXT_POLICY, "skip", 0.95),
+        TextRoutePolicy(CYRILLIC_ABBREVIATION_TEXT_POLICY, "keep", 0.95),
         TextRoutePolicy(CLEAN_CYRILLIC_CAPS_TEXT_POLICY, "capitalizer", 0.85),
         TextRoutePolicy(CLEAN_RUSSIAN_TERM_TEXT_POLICY, "keep", 0.9),
     ]:
@@ -521,6 +538,8 @@ def safety_net_route(key: str, route: CorrectionRoute) -> CorrectionRoute:
     ctx = CorrectionRoutingContext(key=(key or "").strip(), candidate={"key": key}, matches=[])
     for policy in [
         ForceTextRouteAdjustmentPolicy(LATIN_OR_FOREIGN_TEXT_POLICY, "skip", 0.9),
+        ForceTextRouteAdjustmentPolicy(SERVICE_HEADING_TEXT_POLICY, "skip", 0.95),
+        ForceTextRouteAdjustmentPolicy(CYRILLIC_ABBREVIATION_TEXT_POLICY, "keep", 0.95),
         RejectBadCapitalizerPolicy(),
         RejectActiveCorrectionForCleanRussianPolicy(),
     ]:
@@ -548,19 +567,38 @@ def with_suggestion(state: CorrectionState, suggestion: CorrectionSuggestion) ->
     return {**state, "suggestion": suggestion.model_dump()}
 
 
-def suggestion_from_data(data: dict[str, Any], state: CorrectionState, strategy: CorrectionStrategy, status: str) -> CorrectionSuggestion:
-    normalized_key = str(data.get("normalized_key") or state["key"]).strip() or state["key"]
-    confidence = clamp_float(data.get("confidence"), default=0.0)
+def suggestion_from_structured_output(output: CorrectionAgentOutput, state: CorrectionState, strategy: CorrectionStrategy, status: str) -> CorrectionSuggestion:
+    normalized_key = (output.normalized_key or state["key"]).strip() or state["key"]
+    confidence = output.confidence
     if normalized_key == state["key"]:
         confidence = 0.0
         status = "unrecoverable" if strategy == "restorer" else "unchanged"
     return CorrectionSuggestion(
         normalized_key=normalized_key,
-        normalized_value=clean_optional_text(data.get("normalized_value")),
+        normalized_value=clean_optional_text(output.normalized_value),
         confidence=confidence,
-        reason=str(data.get("reason") or f"{strategy} suggestion"),
+        reason=output.reason or f"{strategy} suggestion",
         strategy=strategy,
         status=status,
+    )
+
+
+def suggestion_from_data(data: dict[str, Any], state: CorrectionState, strategy: CorrectionStrategy, status: str) -> CorrectionSuggestion:
+    """Compatibility wrapper for old tests/callers.
+
+    Runtime LLM agents now return CorrectionAgentOutput via structured output;
+    this helper only normalizes already-materialized dictionaries.
+    """
+    return suggestion_from_structured_output(
+        CorrectionAgentOutput.model_validate({
+            "normalized_key": str(data.get("normalized_key") or state["key"]),
+            "normalized_value": data.get("normalized_value"),
+            "confidence": clamp_float(data.get("confidence"), default=0.0),
+            "reason": str(data.get("reason") or f"{strategy} suggestion"),
+        }),
+        state,
+        strategy,
+        status,
     )
 
 

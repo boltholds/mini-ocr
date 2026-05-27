@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, StateGraph
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 

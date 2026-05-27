@@ -11,6 +11,7 @@ from mini_ocr.services.section_detector import (
     SectionDetectionStrategy,
     SectionDetector,
     TermTablePageStrategy,
+    has_numbered_term_rows,
 )
 
 
@@ -79,3 +80,38 @@ class SectionDetectorStrategyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SectionDetectorCandidatePolicyTest(unittest.TestCase):
+    def test_small_table_doc_prefers_focused_table_candidates_over_broad_headers(self):
+        detector = SectionDetector()
+        pages = [
+            PageText(1, "ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ\nТермин\nОпределение\n1. первый\n2. второй", layout_type="table_like"),
+            PageText(2, "Термин\nОпределение\n1. третий\n2. четвертый", layout_type="table_like"),
+            PageText(3, "обычный текст", layout_type="plain"),
+        ]
+
+        candidates = detector.detect(pages)
+
+        self.assertTrue(candidates)
+        self.assertTrue(all(c.source == "table" for c in candidates))
+        self.assertEqual({(c.page_from, c.page_to) for c in candidates}, {(1, 1), (2, 2)})
+
+
+
+class NumberedTermRowsPreservePolicyTest(unittest.TestCase):
+    def test_detects_subsection_numbered_term_rows(self):
+        self.assertTrue(has_numbered_term_rows("2.1. Устройство — часть объекта\n2.2. Элемент — часть объекта"))
+        self.assertFalse(has_numbered_term_rows("1. первый пункт 2. второй пункт"))
+
+    def test_table_pruning_preserves_header_window_with_numbered_term_rows(self):
+        detector = SectionDetector(max_pages_after_header=2)
+        pages = [
+            PageText(1, "ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ\nТермин\nОпределение\n2.1. Устройство — часть объекта\n2.2. Элемент — часть объекта", layout_type="table_like"),
+            PageText(2, "Термин\nОпределение\n2.3. Линия — связь между частями\n2.4. Объект — установка", layout_type="table_like"),
+            PageText(3, "обычный текст", layout_type="plain"),
+        ]
+
+        candidates = detector.detect(pages)
+
+        self.assertTrue(any(c.source == "table" for c in candidates))
+        self.assertTrue(any(c.source == "header" and c.page_from == 1 and c.page_to == 2 for c in candidates))

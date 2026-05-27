@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Protocol, Sequence
 
 from pydantic import BaseModel, ConfigDict
@@ -84,6 +85,108 @@ class SectionDetectionStrategy(Protocol):
         ...
 
 
+class CandidatePreservePolicy(Protocol):
+    """Policy that protects a candidate from overlap pruning."""
+
+    def should_preserve(self, candidate: SectionCandidate, ctx: SectionDetectionContext) -> bool:
+        ...
+
+
+class NumberedTermRowsPreservePolicy:
+    """Keep windows that contain explicit numbered term rows.
+
+    Some standards contain a compact term list formatted as rows like
+    ``2.1. Term — definition``. A one-page table candidate may overlap that
+    area, but the broader header window can still be necessary to keep recall
+    for rows 2.1-2.9. Such windows are protected from table-overlap pruning.
+    """
+
+    min_rows: int = 2
+
+    def should_preserve(self, candidate: SectionCandidate, ctx: SectionDetectionContext) -> bool:
+        if candidate.section_type != "terms":
+            return False
+        return has_numbered_term_rows(candidate.text, min_rows=self.min_rows)
+
+
+class CandidateSelectionPolicy(Protocol):
+    """Post-processing policy for candidate lists.
+
+    Detection strategies are intentionally recall-oriented. Selection policies
+    make the final list less noisy: exact dedup, overlap pruning, and
+    table-document specialization live here instead of inside strategies.
+    """
+
+    def apply(self, candidates: list[SectionCandidate], ctx: SectionDetectionContext) -> list[SectionCandidate]:
+        ...
+
+
+class ExactCandidateDedupPolicy:
+    def apply(self, candidates: list[SectionCandidate], ctx: SectionDetectionContext) -> list[SectionCandidate]:
+        result: list[SectionCandidate] = []
+        seen: set[tuple[str, int, int, str]] = set()
+        for candidate in candidates:
+            key = candidate_identity(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(candidate)
+        return result
+
+
+@dataclass(frozen=True)
+class PreferTableCandidatesForSmallTableDocsPolicy:
+    """Suppress broad header windows in small table-heavy documents.
+
+    Old scanned standards often have one terminology table split across a few
+    pages. Header windows like terms:3-5, terms:4-6, terms:6-8 overlap the
+    same table pages and cause repeated LLM calls and duplicate entities.
+    If the document is small and table strategies produced enough confident
+    candidates, prefer those focused one-page candidates.
+    """
+
+    max_pages: int = 12
+    min_table_candidates: int = 2
+    min_table_score: int = 75
+    preserve_policies: Sequence[CandidatePreservePolicy] = (NumberedTermRowsPreservePolicy(),)
+
+    def apply(self, candidates: list[SectionCandidate], ctx: SectionDetectionContext) -> list[SectionCandidate]:
+        if len(ctx.pages) > self.max_pages:
+            return candidates
+        confident_tables = [
+            c for c in candidates
+            if c.source == "table" and c.score >= self.min_table_score
+        ]
+        if len(confident_tables) < self.min_table_candidates:
+            return candidates
+
+        result: list[SectionCandidate] = []
+        for candidate in candidates:
+            if candidate.source != "header" or candidate.page_to <= candidate.page_from:
+                result.append(candidate)
+                continue
+            if self._overlaps_any_table(candidate, confident_tables):
+                if self._must_preserve(candidate, ctx):
+                    result.append(candidate)
+                continue
+            result.append(candidate)
+        return result
+
+    def _overlaps_any_table(self, candidate: SectionCandidate, tables: Sequence[SectionCandidate]) -> bool:
+        return any(
+            not (table.page_to < candidate.page_from or table.page_from > candidate.page_to)
+            for table in tables
+        )
+
+    def _must_preserve(self, candidate: SectionCandidate, ctx: SectionDetectionContext) -> bool:
+        return any(policy.should_preserve(candidate, ctx) for policy in self.preserve_policies)
+
+
+class SortCandidatesPolicy:
+    def apply(self, candidates: list[SectionCandidate], ctx: SectionDetectionContext) -> list[SectionCandidate]:
+        return sorted(candidates, key=lambda c: (c.page_from, c.section_type, -c.score, c.source))
+
+
 class SectionDetector:
     """Find candidate chunks without binding to a specific document type.
 
@@ -97,10 +200,12 @@ class SectionDetector:
         threshold: int = 82,
         max_pages_after_header: int = 3,
         strategies: Sequence[SectionDetectionStrategy] | None = None,
+        selection_policies: Sequence[CandidateSelectionPolicy] | None = None,
     ) -> None:
         self.threshold = threshold
         self.max_pages_after_header = max_pages_after_header
         self.strategies = list(strategies or default_section_detection_strategies())
+        self.selection_policies = list(selection_policies or default_candidate_selection_policies())
 
     def detect(self, pages: list[tuple[int, str] | PageText]) -> list[SectionCandidate]:
         ctx = SectionDetectionContext(
@@ -110,16 +215,13 @@ class SectionDetector:
         )
 
         candidates: list[SectionCandidate] = []
-        seen: set[tuple[str, int, int, str]] = set()
         for strategy in self.strategies:
-            for candidate in strategy.detect(ctx):
-                key = candidate_identity(candidate)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(candidate)
+            candidates.extend(strategy.detect(ctx))
 
-        return sorted(candidates, key=lambda c: (c.page_from, c.section_type, -c.score))
+        for policy in self.selection_policies:
+            candidates = policy.apply(candidates, ctx)
+
+        return candidates
 
 
 class HeaderSectionStrategy:
@@ -247,6 +349,14 @@ def default_section_detection_strategies() -> list[SectionDetectionStrategy]:
     ]
 
 
+def default_candidate_selection_policies() -> list[CandidateSelectionPolicy]:
+    return [
+        ExactCandidateDedupPolicy(),
+        PreferTableCandidatesForSmallTableDocsPolicy(),
+        SortCandidatesPolicy(),
+    ]
+
+
 def coerce_page(page: tuple[int, str] | PageText) -> PageText:
     if isinstance(page, PageText):
         return page
@@ -318,6 +428,21 @@ def has_repeated_numbered_rows(norm: str) -> bool:
     # rows like "1. ... 2. ... 3. ..." without tying to a specific standard.
     hits = sum(1 for marker in ("1.", "2.", "3.", "4.", "5.") if marker in norm)
     return hits >= 2
+
+
+def has_numbered_term_rows(text: str, min_rows: int = 2) -> bool:
+    """Return true for explicit term rows like ``2.1. Term — definition``.
+
+    This is stronger than ``has_repeated_numbered_rows``. It intentionally
+    looks for subsection-style numbering with at least one dot inside the
+    number, because table classifiers should not preserve every arbitrary
+    numbered list such as ``1. ... 2. ...``.
+    """
+
+    if not text:
+        return False
+    pattern = re.compile(r"(?m)(?:^|\n)\s*\d+(?:\.\d+)+\.\s*[А-ЯЁA-Zа-яё]")
+    return len(pattern.findall(text)) >= min_rows
 
 
 def clamp_score(score: int) -> int:

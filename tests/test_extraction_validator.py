@@ -30,3 +30,19 @@ class ExtractionValidatorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ExtractionValidatorServiceNoiseTest(unittest.TestCase):
+    def test_rejects_table_header_key(self):
+        validator = ExtractionValidator()
+        entity = ExtractedEntity(key="Группа", value="Шифр Наименование Определение", source_text="Группа Шифр Наименование Определение", confidence=0.49)
+        decision = validator.validate("term", entity, "Группа Шифр Наименование Определение", "terms")
+        self.assertFalse(decision.keep)
+        self.assertEqual(decision.reason, "table header is not a term")
+
+    def test_rejects_section_heading_key(self):
+        validator = ExtractionValidator()
+        entity = ExtractedEntity(key="ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ", value="Термины и определения", source_text="ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ", confidence=0.9)
+        decision = validator.validate("term", entity, "ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ", "terms")
+        self.assertFalse(decision.keep)
+        self.assertEqual(decision.reason, "section heading is not a term")
+

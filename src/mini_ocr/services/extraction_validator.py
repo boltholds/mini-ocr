@@ -8,6 +8,21 @@ from typing import Protocol
 from mini_ocr.schemas.extraction import ExtractedEntity
 
 
+TABLE_HEADER_KEYS = (
+    "группа",
+    "шифр",
+    "наименование",
+    "определение",
+)
+
+SERVICE_HEADING_KEYS = (
+    "термины",
+    "термины и определения",
+    "классификация",
+    "типы",
+    "электрические схемы",
+)
+
 BAD_TERM_KEYS = (
     "применение терминов",
     "применение терминов-синонимов",
@@ -148,6 +163,8 @@ class ExtractionValidator:
                 EmptyKeyValueRule(),
                 TermSectionRule(),
                 TermLengthRule(),
+                TableHeaderKeyRule(),
+                ServiceHeadingKeyRule(),
                 ServiceTermRule(),
                 ServiceValueRule(),
                 ForeignAliasConfidenceRule(),
@@ -222,6 +239,26 @@ class TermLengthRule:
             return ValidationDecision(False, 0.0, "rejected", "too short")
         if len(ctx.key.split()) > 8:
             return ValidationDecision(False, 0.0, "rejected", "key is too long for a term")
+        return None
+
+
+class TableHeaderKeyRule:
+    def apply(self, ctx: ValidationContext) -> ValidationDecision | None:
+        key_lower = ctx.key.lower().replace("ё", "е")
+        if key_lower in TABLE_HEADER_KEYS:
+            return ValidationDecision(False, 0.0, "rejected", "table header is not a term")
+        return None
+
+
+class ServiceHeadingKeyRule:
+    def apply(self, ctx: ValidationContext) -> ValidationDecision | None:
+        key_lower = ctx.key.lower().replace("ё", "е")
+        value_lower = ctx.value.lower().replace("ё", "е")
+        source_lower = ctx.source.lower().replace("ё", "е")
+        if key_lower not in SERVICE_HEADING_KEYS:
+            return None
+        if len(ctx.value.split()) <= 8 or key_lower in source_lower or "термин" in value_lower or "определ" in value_lower:
+            return ValidationDecision(False, 0.0, "rejected", "section heading is not a term")
         return None
 
 

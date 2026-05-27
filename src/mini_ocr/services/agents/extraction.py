@@ -1,27 +1,26 @@
 from __future__ import annotations
 
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from mini_ocr.schemas.extraction import ExtractionResult
 from mini_ocr.services.llm.client import build_chat_model
 from mini_ocr.services.llm.prompt import SYSTEM_PROMPT
 from mini_ocr.services.section_detector import SectionCandidate
-from mini_ocr.utils.json_utils import loads_json_relaxed
 from mini_ocr.utils.text import compact
 
 
 class ExtractionAgent:
     """LLM extractor for one section candidate.
 
-    The class is deliberately small: prompt invocation, JSON parsing, and source
-    grounding. Persistence and orchestration stay in the workflow layer.
+    The agent uses LangChain structured output, so the LLM boundary returns an
+    ExtractionResult directly instead of a JSON string that has to be parsed and
+    repaired manually.
     """
 
     extractor_name = "langchain_llm"
 
     def __init__(self) -> None:
-        self.llm = build_chat_model()
+        self.llm = build_chat_model().with_structured_output(ExtractionResult)
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", SYSTEM_PROMPT),
             (
@@ -31,20 +30,19 @@ class ExtractionAgent:
                 "page_from={page_from}\n"
                 "page_to={page_to}\n\n"
                 "OCR text:\n{text}\n\n"
-                "Return only a JSON object with keys 'abbreviations' and 'terms'.",
+                "Return a structured ExtractionResult object.",
             ),
         ])
-        self.chain = self.prompt | self.llm | StrOutputParser()
+        self.chain = self.prompt | self.llm
 
     def extract(self, candidate: SectionCandidate) -> ExtractionResult:
-        content = self.chain.invoke({
+        result = self.chain.invoke({
             "section_type": candidate.section_type,
             "page_from": candidate.page_from,
             "page_to": candidate.page_to,
             "text": candidate.text[:30000],
         })
-        result = ExtractionResult.model_validate(loads_json_relaxed(content))
-        return self._ground_to_source(result, candidate.text)
+        return self._ground_to_source(ExtractionResult.model_validate(result), candidate.text)
 
     def _ground_to_source(self, result: ExtractionResult, source: str) -> ExtractionResult:
         normalized_source = compact(source).lower()

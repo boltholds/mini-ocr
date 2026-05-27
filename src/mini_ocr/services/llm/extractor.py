@@ -1,12 +1,12 @@
-import json
-import re
-from typing import Any
+from __future__ import annotations
 
-from openai import OpenAI
-from pydantic import ValidationError
+import re
+
+from langchain_core.prompts import ChatPromptTemplate
 
 from mini_ocr.core.config import settings
 from mini_ocr.schemas.extraction import ExtractedEntity, ExtractionResult
+from mini_ocr.services.llm.client import build_chat_model
 from mini_ocr.services.llm.prompt import SYSTEM_PROMPT
 
 
@@ -21,45 +21,20 @@ class LLMStructuredExtractor(StructuredExtractor):
     extractor_name = "llm"
 
     def __init__(self) -> None:
-        provider = settings.llm_provider.lower().strip()
-        base_url = settings.llm_base_url
-        api_key = settings.llm_api_key
-
-        if provider == "ollama":
-            base_url = base_url or "http://localhost:11434/v1"
-            api_key = api_key or "ollama"
-
-        if not api_key:
-            raise RuntimeError("LLM_API_KEY is not set. For Ollama use LLM_API_KEY=ollama")
-
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self.client = OpenAI(**kwargs)
-        self.provider = provider
+        self.llm = build_chat_model().with_structured_output(ExtractionResult)
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", SYSTEM_PROMPT),
+            (
+                "human",
+                "OCR text:\n{text}\n\n"
+                "Return a structured ExtractionResult object.",
+            ),
+        ])
+        self.chain = self.prompt | self.llm
 
     def extract(self, text: str) -> ExtractionResult:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text[:30000]},
-        ]
-
-        kwargs: dict[str, Any] = {
-            "model": settings.llm_model,
-            "messages": messages,
-            "temperature": 0,
-        }
-
-        # Ollama's OpenAI-compatible endpoint is more reliable without response_format
-        # for small local models. For OpenAI-compatible cloud providers, keep JSON mode.
-        if self.provider != "ollama":
-            kwargs["response_format"] = {"type": "json_object"}
-
-        response = self.client.chat.completions.create(**kwargs)
-        content = response.choices[0].message.content or "{}"
-        data = _loads_json_relaxed(content)
-        result = ExtractionResult.model_validate(data)
-        return self._ground_to_source(result, text)
+        result = self.chain.invoke({"text": text[:30000]})
+        return self._ground_to_source(ExtractionResult.model_validate(result), text)
 
     def _ground_to_source(self, result: ExtractionResult, source: str) -> ExtractionResult:
         normalized_source = _compact(source).lower()
@@ -73,7 +48,7 @@ class LLMStructuredExtractor(StructuredExtractor):
 
 
 class RegexFallbackExtractor(StructuredExtractor):
-    """Conservative fallback. It is intentionally disabled by default."""
+    """Conservative deterministic extractor. It is intentionally disabled by default."""
 
     extractor_name = "regex"
     PAIR_RE = re.compile(r"^\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9 ./_-]{1,80})\s+[—–-]\s+(.{3,})$")
@@ -125,21 +100,6 @@ class HybridExtractor(StructuredExtractor):
             return self.fallback.extract(text)
 
         return ExtractionResult(abbreviations=[], terms=[])
-
-
-def _loads_json_relaxed(content: str) -> dict[str, Any]:
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?", "", content.strip(), flags=re.IGNORECASE).strip()
-        content = re.sub(r"```$", "", content.strip()).strip()
-
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-        if not match:
-            raise
-        return json.loads(match.group(0))
 
 
 def _compact(text: str) -> str:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Protocol, Sequence
+from typing import Any, Literal, Protocol, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -8,7 +8,7 @@ from mini_ocr.utils.text import clamp_float
 
 
 class ValidationDecision(BaseModel):
-    decision: str = Field(description="auto | needs_review | rejected")
+    decision: Literal["auto", "needs_review", "rejected"] = Field(description="auto | needs_review | rejected")
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
     normalized_key: str | None = None

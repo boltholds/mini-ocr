@@ -46,3 +46,18 @@ class TextPoliciesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ServiceAndAbbreviationPolicyTest(unittest.TestCase):
+    def test_cyrillic_abbreviation_policy_keeps_all_caps_abbreviation(self):
+        from mini_ocr.services.policies.text import CYRILLIC_ABBREVIATION_TEXT_POLICY
+
+        self.assertTrue(CYRILLIC_ABBREVIATION_TEXT_POLICY.matches("СЭВ"))
+        self.assertFalse(CYRILLIC_ABBREVIATION_TEXT_POLICY.matches("КЛАССИФИКАЦИЯ"))
+
+    def test_service_heading_policy_detects_table_headers_and_section_headings(self):
+        from mini_ocr.services.policies.text import SERVICE_HEADING_TEXT_POLICY
+
+        self.assertTrue(SERVICE_HEADING_TEXT_POLICY.matches("Группа"))
+        self.assertTrue(SERVICE_HEADING_TEXT_POLICY.matches("ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ"))
+        self.assertFalse(SERVICE_HEADING_TEXT_POLICY.matches("Линия электрической связи"))
+

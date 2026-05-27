@@ -43,6 +43,23 @@ Pydantic validation + source grounding
 save extracted_items in PostgreSQL
 ```
 
+
+## Внутренняя архитектура pipeline
+
+`ProcessingPipeline` теперь является тонким фасадом. Он не содержит OCR/render/cleanup-логику напрямую, а только собирает зависимости:
+
+```text
+DocumentRegistry                 — регистрация PDF, file hash, storage path
+DocumentProcessingOrchestrator   — порядок стадий и статусы документа
+RenderPagesStage                 — PDF -> images + render cache
+OCRPagesStage                    — OCR per page + сохранение блоков/аналитики
+ExtractItemsStage                — section detection + LangGraph extraction
+PageStore                        — DB-операции по страницам, OCR cache, cleanup extraction output
+DocumentStatusService            — переходы статусов registered/rendering/ocr/extracting/processed/failed
+```
+
+Так DB persistence, OCR, render, регистрация документа и orchestration больше не смешаны в одном классе. Оркестратор тестируется через fake stages без реальной БД и OCR.
+
 ## Быстрый запуск
 
 ```bash
@@ -300,3 +317,7 @@ Current tests cover:
 - relaxed JSON parsing for LLM output;
 - OCR/text heuristics for Russian, Latin, mixed-script and caps keys;
 - deterministic extraction validator guardrails.
+
+## Docker
+
+CPU/GPU Docker deployment files are documented in [DOCKER.md](DOCKER.md).

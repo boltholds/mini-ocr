@@ -9,6 +9,21 @@ from mini_ocr.utils.text import compact, letter_stats
 FOREIGN_DOT_ALIAS_RE = re.compile(r"^[A-ZА-Я]\.?.*\s+[A-Za-z].*")
 BAD_SYMBOL_RE = re.compile(r"[@#$%^*_+=<>|]")
 
+SERVICE_HEADING_TEXTS = {
+    "термины",
+    "термины и определения",
+    "классификация",
+    "типы",
+    "электрические схемы",
+}
+
+TABLE_HEADER_TEXTS = {
+    "группа",
+    "шифр",
+    "наименование",
+    "определение",
+}
+
 
 @dataclass(frozen=True)
 class TextFeatures:
@@ -109,6 +124,37 @@ class LatinOrForeignPolicy(BaseTextPolicy):
 
 
 @dataclass(frozen=True)
+class CyrillicAbbreviationPolicy(BaseTextPolicy):
+    name: str = "cyrillic_abbreviation"
+    reason: str = "Ключ выглядит как кириллическая аббревиатура; менять регистр нельзя."
+    min_letters: int = 2
+    max_letters: int = 8
+
+    def matches_features(self, features: TextFeatures) -> bool:
+        if not features.has_letters or features.has_latin:
+            return False
+        if features.words_count != 1:
+            return False
+        if not (self.min_letters <= features.letters <= self.max_letters):
+            return False
+        if features.cyrillic != features.letters:
+            return False
+        if features.digit_count > 0:
+            return False
+        return features.upper_ratio >= 0.85
+
+
+@dataclass(frozen=True)
+class ServiceHeadingPolicy(BaseTextPolicy):
+    name: str = "service_heading"
+    reason: str = "Ключ выглядит как заголовок раздела или колонка таблицы, а не как термин."
+
+    def matches_features(self, features: TextFeatures) -> bool:
+        norm = features.text.lower().replace("ё", "е")
+        return norm in SERVICE_HEADING_TEXTS or norm in TABLE_HEADER_TEXTS
+
+
+@dataclass(frozen=True)
 class CleanCyrillicCapsPolicy(BaseTextPolicy):
     name: str = "clean_cyrillic_caps"
     reason: str = "Термин написан заглавными русскими буквами."
@@ -167,6 +213,8 @@ class OCRNoisyPolicy(BaseTextPolicy):
 
 MIXED_CYRILLIC_LATIN_TEXT_POLICY = MixedCyrillicLatinPolicy()
 LATIN_OR_FOREIGN_TEXT_POLICY = LatinOrForeignPolicy()
+CYRILLIC_ABBREVIATION_TEXT_POLICY = CyrillicAbbreviationPolicy()
+SERVICE_HEADING_TEXT_POLICY = ServiceHeadingPolicy()
 CLEAN_CYRILLIC_CAPS_TEXT_POLICY = CleanCyrillicCapsPolicy()
 CLEAN_RUSSIAN_TERM_TEXT_POLICY = CleanRussianTermPolicy(caps_policy=CLEAN_CYRILLIC_CAPS_TEXT_POLICY)
 OCR_NOISY_TEXT_POLICY = OCRNoisyPolicy(mixed_policy=MIXED_CYRILLIC_LATIN_TEXT_POLICY)
