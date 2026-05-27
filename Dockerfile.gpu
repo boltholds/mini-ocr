@@ -1,18 +1,19 @@
-# GPU image for NVIDIA hosts. It uses the same app code as CPU image, but
-# swaps the CPU Paddle package for a GPU Paddle package at build time.
-# The exact Paddle GPU wheel may depend on CUDA/Python versions, so keep these
-# args overrideable from docker compose or CLI.
-FROM python:3.13-slim AS runtime
+# GPU image for NVIDIA hosts.
+#
+# Paddle GPU wheels are not reliably available for Python 3.13 from the
+# default PyPI index. This image therefore uses Python 3.12 and installs
+# application dependencies directly from pyproject.toml, excluding the CPU
+# paddlepaddle package, then installs the CUDA-specific paddlepaddle-gpu wheel
+# from the Paddle package index.
+FROM python:3.12-slim AS runtime
 
 ARG PADDLE_GPU_PACKAGE="paddlepaddle-gpu==3.2.2"
-ARG PADDLE_GPU_INDEX_URL=""
+ARG PADDLE_GPU_INDEX_URL="https://www.paddlepaddle.org.cn/packages/stable/cu129/"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
     PIP_NO_CACHE_DIR=1 \
-    POETRY_NO_INTERACTION=1 \
-    POETRY_VIRTUALENVS_CREATE=false \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
@@ -23,16 +24,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgl1 libgomp1 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir "poetry>=2.0,<3.0"
+COPY pyproject.toml README.md ./
 
-COPY pyproject.toml poetry.lock README.md ./
-RUN poetry install --only main --no-ansi --no-root \
+RUN python - <<'PY' \
+    && pip install --no-cache-dir -r /tmp/requirements-main.txt \
     && pip uninstall -y paddlepaddle || true \
-    && if [ -n "$PADDLE_GPU_INDEX_URL" ]; then \
-         pip install --no-cache-dir "$PADDLE_GPU_PACKAGE" -i "$PADDLE_GPU_INDEX_URL"; \
-       else \
-         pip install --no-cache-dir "$PADDLE_GPU_PACKAGE"; \
-       fi
+    && pip install --no-cache-dir "${PADDLE_GPU_PACKAGE}" -i "${PADDLE_GPU_INDEX_URL}"
+import re
+import tomllib
+from pathlib import Path
+
+project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+requirements: list[str] = []
+for dep in project.get("dependencies", []):
+    # Convert Poetry-style strings such as
+    #   "fastapi (>=0.136.1,<0.137.0)"
+    # to pip-compatible requirement strings:
+    #   "fastapi>=0.136.1,<0.137.0"
+    requirement = re.sub(r"\s+\(([^)]*)\)$", r"\1", dep).strip()
+    package_name = re.split(r"[<>=!~\[ ;]", requirement, maxsplit=1)[0].lower()
+    if package_name == "paddlepaddle":
+        continue
+    requirements.append(requirement)
+
+Path("/tmp/requirements-main.txt").write_text(
+    "\n".join(requirements) + "\n",
+    encoding="utf-8",
+)
+PY
 
 COPY src ./src
 

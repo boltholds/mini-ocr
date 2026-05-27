@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile.gpu
       args:
         PADDLE_GPU_PACKAGE: ${PADDLE_GPU_PACKAGE:-paddlepaddle-gpu==3.2.2}
-        PADDLE_GPU_INDEX_URL: ${PADDLE_GPU_INDEX_URL:-}
+        PADDLE_GPU_INDEX_URL: ${PADDLE_GPU_INDEX_URL:-https://www.paddlepaddle.org.cn/packages/stable/cu129/}
     image: mini-ocr:gpu
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ocr_db}
@@ -27,7 +27,8 @@ services:
       FLAGS_fraction_of_gpu_memory_to_use: ${PADDLE_GPU_MEMORY_FRACTION:-0.95}
 
       ENABLE_LLM: ${ENABLE_LLM:-true}
-      ENABLE_REGEX_FALLBACK: ${ENABLE_REGEX_FALLBACK:-false}
+      ENABLE_REGEX_FALLBACK: ${ENABLE_REGEX_FALLBACK:-true}
+      FALLBACK_ON_LLM_ERROR: ${FALLBACK_ON_LLM_ERROR:-true}
       ENABLE_LANGGRAPH_WORKFLOW: ${ENABLE_LANGGRAPH_WORKFLOW:-true}
       ENABLE_AGENT_VALIDATION: ${ENABLE_AGENT_VALIDATION:-true}
       ENABLE_OCR_CORRECTION_AGENT: ${ENABLE_OCR_CORRECTION_AGENT:-true}
@@ -40,7 +41,8 @@ services:
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
       PROMPT_VERSION: ${PROMPT_VERSION:-terms_abbrev_extractor_v9_clean_architecture}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
-      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-1}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-0}
+      LLM_HEALTH_TIMEOUT_SECONDS: ${LLM_HEALTH_TIMEOUT_SECONDS:-5}
       VALIDATION_AUTO_THRESHOLD: ${VALIDATION_AUTO_THRESHOLD:-0.75}
       CORRECTION_AUTO_THRESHOLD: ${CORRECTION_AUTO_THRESHOLD:-0.70}
 

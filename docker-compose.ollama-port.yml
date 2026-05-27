@@ -1,0 +1,8 @@
+# Optional override: publish the Compose Ollama service to the host.
+# Use only when you want to call the containerized Ollama from the host.
+# Default host port is 11435 to avoid conflict with a host Ollama on 11434.
+
+services:
+  ollama:
+    ports:
+      - "${OLLAMA_HOST_PORT:-11435}:11434"

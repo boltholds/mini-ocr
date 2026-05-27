@@ -1,0 +1,66 @@
+# Optional override for a self-contained local LLM runtime.
+# Usage with CPU:
+#   docker compose -f docker-compose.cpu.yml -f docker-compose.ollama.yml --env-file .env up --build
+# Usage with GPU:
+#   docker compose -f docker-compose.gpu.yml -f docker-compose.ollama.yml --env-file .env up --build
+
+services:
+  app:
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      LLM_BASE_URL: http://ollama:11434/v1
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+      ENABLE_REGEX_FALLBACK: ${ENABLE_REGEX_FALLBACK:-true}
+      FALLBACK_ON_LLM_ERROR: ${FALLBACK_ON_LLM_ERROR:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      ollama-pull:
+        condition: service_completed_successfully
+
+  ollama:
+    image: ollama/ollama:latest
+    # Port 11434 is intentionally not published to the host by default.
+    # The app and ollama-pull services reach Ollama through the Compose network:
+    #   http://ollama:11434
+    # This avoids conflicts when Ollama is already running on the host.
+    expose:
+      - "11434"
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    gpus: all
+    restart: unless-stopped
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_started
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "until ollama list >/dev/null 2>&1; do
+        echo 'waiting for ollama...';
+        sleep 2;
+      done;
+      echo pulling $$OLLAMA_MODEL;
+      ollama pull $$OLLAMA_MODEL"
+    restart: "no"
+
+volumes:
+  ollama_data:
