@@ -218,4 +218,13 @@ __marimo__/
 .streamlit/secrets.toml
 
 data/
-samples/
+samples/*
+!samples/.gitkeep
+!samples/README.md
+logs/
+*.log
+.env
+.env.*
+!.env.example
+!.env.cpu.example
+!.env.gpu.example
