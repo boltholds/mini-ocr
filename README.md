@@ -1,8 +1,8 @@
-# OCR + LLM Document Extractor
+# OCR + LLM извлечение данных из документов
 
 MVP-сервис для автоматического извлечения перечней сокращений, терминов и определений из PDF-сканов без текстового слоя.
 
-Решение рассчитано на документы с разным качеством сканов, произвольным расположением разделов и возможным отсутствием нужных разделов. Все промежуточные результаты сохраняются в PostgreSQL, поэтому сервис можно безопасно перезапускать: уже распознанные страницы и уже выполненные extraction jobs не обрабатываются повторно.
+Решение рассчитано на документы с разным качеством сканов, произвольным расположением разделов и возможным отсутствием нужных разделов. Все промежуточные результаты сохраняются в PostgreSQL, поэтому сервис можно безопасно перезапускать: уже распознанные страницы и уже выполненные задания извлечения повторно не обрабатываются.
 
 ## Что внутри
 
@@ -10,39 +10,38 @@ MVP-сервис для автоматического извлечения пе
 - PostgreSQL
 - PaddleOCR для OCR PDF-сканов
 - PyMuPDF для рендера PDF-страниц в изображения
-- OpenCV preprocessing
-- fuzzy section detection через RapidFuzz
-- LLM structured extraction через OpenAI-compatible API
-- Pydantic validation результата
-- source grounding: сохраняется исходный OCR-фрагмент
-- file hash и input text hash для дедупликации
-- статусы документов, страниц и extraction jobs
+- OpenCV для предварительной обработки изображений
+- нечёткий поиск разделов через RapidFuzz
+- структурированное LLM-извлечение через OpenAI-compatible API
+- Pydantic-валидация результата
+- привязка к источнику: сохраняется исходный OCR-фрагмент
+- хэш файла и хэш входного текста для дедупликации
+- статусы документов, страниц и заданий извлечения
 - Docker Compose
 
 ## Pipeline
 
 ```text
-PDF scan
+PDF-скан
   ↓
-register document + sha256(file)
+регистрация документа + sha256(file)
   ↓
-render pages to images
+рендер страниц в изображения
   ↓
-preprocess page images
+предварительная обработка изображений страниц
   ↓
-PaddleOCR per page
+PaddleOCR по каждой странице
   ↓
-save OCR text + OCR blocks with bbox/confidence
+сохранение OCR-текста + OCR-блоков с bbox/confidence
   ↓
-fuzzy search for sections
+нечёткий поиск нужных разделов
   ↓
-LLM extracts JSON from candidate fragments
+LLM извлекает JSON из фрагментов-кандидатов
   ↓
-Pydantic validation + source grounding
+Pydantic-валидация + привязка к исходному тексту
   ↓
-save extracted_items in PostgreSQL
+сохранение extracted_items в PostgreSQL
 ```
-
 
 ## Внутренняя архитектура pipeline
 
@@ -58,7 +57,7 @@ PageStore                        — DB-операции по страницам
 DocumentStatusService            — переходы статусов registered/rendering/ocr/extracting/processed/failed
 ```
 
-Так DB persistence, OCR, render, регистрация документа и orchestration больше не смешаны в одном классе. Оркестратор тестируется через fake stages без реальной БД и OCR.
+Благодаря этому сохранение в БД, OCR, рендеринг, регистрация документа и оркестрация больше не смешаны в одном классе. Оркестратор тестируется через fake stages без реальной БД и OCR.
 
 ## Быстрый запуск
 
@@ -111,7 +110,7 @@ LLM_MODEL=gpt-4o-mini
 ENABLE_LLM=true
 ```
 
-Если `LLM_API_KEY` не задан, сервис использует простой regex fallback. Это удобно для локальной проверки пайплайна без внешнего API, но для качества извлечения в тестовом сценарии предполагается LLM.
+Если `LLM_API_KEY` не задан, сервис использует простой regex fallback. Это удобно для локальной проверки пайплайна без внешнего API, но для качественного извлечения в тестовом сценарии предполагается LLM.
 
 ## GPU
 
@@ -127,7 +126,7 @@ OCR_USE_GPU=false
 OCR_USE_GPU=true
 ```
 
-Ограничение 32 GB VRAM учитывается архитектурно: OCR выполняется постранично, без загрузки всего документа в память. Для production-режима batch size OCR/LLM должен задаваться конфигурацией.
+Ограничение 32 GB VRAM учтено архитектурно: OCR выполняется постранично, без загрузки всего документа в память. Для production-режима batch size OCR/LLM должен задаваться конфигурацией.
 
 ## Отказоустойчивость и рестарт
 
@@ -202,30 +201,29 @@ docker compose run --rm app python -m mini_ocr.cli get-items "document.pdf"
 
 - вынести обработку в background worker;
 - добавить UI для `needs_review`;
-- добавить отдельный LLM validation pass;
+- добавить отдельный LLM-проход для валидации;
 - добавить table-aware extraction по OCR bbox;
 - добавить Alembic migrations вместо `create_all`;
 - добавить метрики: OCR time, pages/sec, LLM tokens, items extracted, average confidence.
 
+## Агент коррекции OCR
 
-## OCR correction agent
-
-The LangGraph workflow includes a dedicated `OCRCorrectionAgent` node between extraction and validation:
+LangGraph workflow включает отдельный узел `OCRCorrectionAgent` между извлечением и валидацией:
 
 ```text
 extract -> save -> normalize -> validate
 ```
 
-The correction agent runs for every low-confidence / `needs_review` candidate and for OCR-noisy keys. It does not overwrite the original `key`, `value` or `source_text`. Instead it writes suggestion fields:
+Агент коррекции запускается для каждого кандидата с низкой уверенностью / `needs_review`, а также для ключей, которые выглядят как OCR-noisy. Он не перезаписывает исходные поля `key`, `value` и `source_text`. Вместо этого он записывает поля с предложениями:
 
 - `normalized_key`
 - `normalized_value`
 - `correction_confidence`
 - `correction_reason`
 
-For uncertain OCR cases, the agent still returns a `normalized_key` hypothesis, but keeps the item in `needs_review`. This is useful for old scans where Cyrillic and Latin glyphs are often mixed by OCR.
+Для неоднозначных OCR-случаев агент всё равно возвращает гипотезу в `normalized_key`, но оставляет item в статусе `needs_review`. Это полезно для старых сканов, где OCR часто смешивает кириллические и латинские символы.
 
-If the database was created before this version, run once:
+Если база данных была создана до этой версии, один раз выполните:
 
 ```sql
 ALTER TABLE extracted_items ADD COLUMN IF NOT EXISTS normalized_key TEXT;
@@ -234,7 +232,7 @@ ALTER TABLE extracted_items ADD COLUMN IF NOT EXISTS correction_confidence DOUBL
 ALTER TABLE extracted_items ADD COLUMN IF NOT EXISTS correction_reason TEXT;
 ```
 
-Recommended flags:
+Рекомендуемые флаги:
 
 ```env
 ENABLE_LANGGRAPH_WORKFLOW=true
@@ -244,10 +242,9 @@ ENABLE_RAG_VALIDATION=true
 PROMPT_VERSION=terms_abbrev_extractor_v6_aggressive_correction
 ```
 
-## Agent tracing and timing
+## Трассировка и тайминги агентов
 
-The LangGraph workflow now logs every important stage and every agent call.
-Tracing is controlled by environment variables:
+LangGraph workflow теперь логирует каждую важную стадию и каждый вызов агента. Трассировка управляется переменными окружения:
 
 ```env
 ENABLE_AGENT_TRACING=true
@@ -255,11 +252,9 @@ AGENT_LOG_LEVEL=INFO
 AGENT_LOG_FILE=logs/agents.log
 ```
 
-The log format is line-oriented and JSON-like. Each timed operation emits a
-`start` event and an `end` event with `duration_ms`; failures emit an `error`
-event with the exception type/message.
+Формат лога — построчный и JSON-like. Каждая измеряемая операция пишет событие `start` и событие `end` с `duration_ms`; ошибки пишутся как событие `error` с типом и сообщением исключения.
 
-Examples of stages:
+Примеры стадий:
 
 ```text
 pipeline.render_pages
@@ -277,24 +272,23 @@ agent.rag_validation
 rag.retrieve_for_validation
 ```
 
-This makes it easy to see where the pipeline spends time and whether every
-candidate passed through extraction, correction and validation.
+Так проще увидеть, где pipeline тратит время и прошёл ли каждый кандидат через извлечение, коррекцию и валидацию.
 
-## Clean architecture refactor
+## Рефакторинг чистой архитектуры
 
-The processing code is split into small, testable modules:
+Код обработки разделён на небольшие тестируемые модули:
 
 ```text
-src/mini_ocr/services/langgraph_workflow.py      # document-level orchestration only
-src/mini_ocr/services/agents/extraction.py       # LLM extraction agent
-src/mini_ocr/services/agents/correction.py       # LangGraph correction router/subgraph
-src/mini_ocr/services/agents/validation.py       # RAG-assisted validation agent
-src/mini_ocr/utils/json_utils.py                 # robust LLM JSON parsing
-src/mini_ocr/utils/text.py                       # OCR/text heuristics
-src/mini_ocr/core/schema.py                      # small runtime schema compatibility migration
+src/mini_ocr/services/langgraph_workflow.py      # только оркестрация на уровне документа
+src/mini_ocr/services/agents/extraction.py       # LLM-агент извлечения
+src/mini_ocr/services/agents/correction.py       # LangGraph router/subgraph коррекции
+src/mini_ocr/services/agents/validation.py       # RAG-assisted агент валидации
+src/mini_ocr/utils/json_utils.py                 # устойчивый парсинг JSON из LLM-ответов
+src/mini_ocr/utils/text.py                       # OCR/text эвристики
+src/mini_ocr/core/schema.py                      # небольшая runtime migration для совместимости схемы
 ```
 
-The correction subgraph is now explicit:
+Подграф коррекции теперь явный:
 
 ```text
 route
@@ -302,22 +296,22 @@ route
   -> post_filter
 ```
 
-Original OCR fields are never overwritten. The system writes corrections only to `normalized_key`, `normalized_value`, `correction_confidence`, `correction_reason`, `correction_strategy`, `correction_status`, and `correction_orchestrator_reason`.
+Исходные OCR-поля никогда не перезаписываются. Система записывает коррекции только в `normalized_key`, `normalized_value`, `correction_confidence`, `correction_reason`, `correction_strategy`, `correction_status` и `correction_orchestrator_reason`.
 
-## Tests
+## Тесты
 
-Run:
+Запуск:
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-Current tests cover:
+Текущие тесты покрывают:
 
-- relaxed JSON parsing for LLM output;
-- OCR/text heuristics for Russian, Latin, mixed-script and caps keys;
-- deterministic extraction validator guardrails.
+- relaxed JSON parsing для LLM-ответов;
+- OCR/text эвристики для русских, латинских, mixed-script и caps-ключей;
+- guardrails deterministic extraction validator.
 
 ## Docker
 
-CPU/GPU Docker deployment files are documented in [DOCKER.md](DOCKER.md).
+Docker-файлы для CPU/GPU-развёртывания описаны в [DOCKER.md](DOCKER.md).

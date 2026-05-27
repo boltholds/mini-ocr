@@ -1,13 +1,13 @@
-# Docker deployment
+# Docker-развёртывание
 
-There are two Compose files:
+В проекте есть два Compose-файла:
 
-- `docker-compose.cpu.yml` — CPU OCR runtime.
-- `docker-compose.gpu.yml` — NVIDIA GPU OCR runtime.
+- `docker-compose.cpu.yml` — runtime для OCR на CPU.
+- `docker-compose.gpu.yml` — runtime для OCR на NVIDIA GPU.
 
-The default `docker-compose.yml` points to the CPU setup for backward compatibility.
+Файл `docker-compose.yml` по умолчанию указывает на CPU-настройку для обратной совместимости.
 
-## CPU run
+## Запуск на CPU
 
 ```bash
 cp .env.cpu.example .env
@@ -20,38 +20,37 @@ API:
 curl http://localhost:8000/health
 ```
 
-## GPU run
+## Запуск на GPU
 
-Host requirements:
+Требования к хосту:
 
-- NVIDIA driver installed.
-- NVIDIA Container Toolkit installed.
-- `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` works.
+- установлен NVIDIA driver;
+- установлен NVIDIA Container Toolkit;
+- команда `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` работает.
 
-Run:
+Запуск:
 
 ```bash
 cp .env.gpu.example .env
 docker compose -f docker-compose.gpu.yml --env-file .env up --build
 ```
 
+### Индекс Paddle GPU wheel
 
-### Paddle GPU wheel index
+GPU-образ использует `python:3.12-slim`, потому что Paddle GPU wheels могут быть недоступны для Python 3.13. Образ устанавливает зависимости приложения из `pyproject.toml`, удаляет CPU-пакет `paddlepaddle`, если он появился транзитивно, а затем устанавливает настроенный GPU wheel из Paddle CUDA index.
 
-The GPU image uses `python:3.12-slim` because Paddle GPU wheels may be unavailable for Python 3.13. The image installs app dependencies from `pyproject.toml`, removes the CPU `paddlepaddle` package if it appears transitively, and then installs the configured GPU wheel from the Paddle CUDA index.
-
-Defaults:
+Значения по умолчанию:
 
 ```env
 PADDLE_GPU_PACKAGE=paddlepaddle-gpu==3.2.2
 PADDLE_GPU_INDEX_URL=https://www.paddlepaddle.org.cn/packages/stable/cu129/
 ```
 
-If your host/driver stack requires another CUDA build, override `PADDLE_GPU_INDEX_URL` in `.env`, for example `https://www.paddlepaddle.org.cn/packages/stable/cu118/`.
+Если стек хоста/драйвера требует другую CUDA-сборку, переопределите `PADDLE_GPU_INDEX_URL` в `.env`, например `https://www.paddlepaddle.org.cn/packages/stable/cu118/`.
 
-## PostgreSQL memory limit
+## Ограничение памяти PostgreSQL
 
-Both Compose files limit PostgreSQL with:
+Оба Compose-файла ограничивают PostgreSQL следующими настройками:
 
 ```env
 POSTGRES_MEMORY_LIMIT=2g
@@ -63,39 +62,39 @@ POSTGRES_EFFECTIVE_CACHE_SIZE=1536MB
 POSTGRES_MAX_CONNECTIONS=50
 ```
 
-For this OCR app PostgreSQL is not the bottleneck, so `2g` is intentionally conservative. Raise it only if you start storing many documents and running heavy validation queries.
+Для этого OCR-приложения PostgreSQL не является узким местом, поэтому `2g` выбран как консервативное значение. Увеличивайте его только если начнёте хранить много документов и запускать тяжёлые validation queries.
 
-## GPU / 32GB VRAM note
+## Примечание про GPU / 32 GB VRAM
 
-Docker Compose can request/select a GPU, but it cannot enforce a hard per-container VRAM limit. The environment contains:
+Docker Compose может запросить или выбрать GPU, но не может задать жёсткий лимит VRAM для конкретного контейнера. В окружении есть:
 
 ```env
 GPU_MEMORY_LIMIT_GB=32
 PADDLE_GPU_MEMORY_FRACTION=0.95
 ```
 
-These values are configuration hints. They are not a Docker-level VRAM cgroup.
+Эти значения являются конфигурационными подсказками. Это не Docker-level VRAM cgroup.
 
-If you need a real 32GB VRAM boundary, use NVIDIA MIG on the host and expose only the selected MIG device to the container:
+Если нужна реальная граница в 32 GB VRAM, используйте NVIDIA MIG на хосте и пробросьте в контейнер только выбранное MIG-устройство:
 
 ```env
 NVIDIA_VISIBLE_DEVICES=MIG-<uuid>
 ```
 
-Without MIG, the practical controls are:
+Без MIG практические варианты контроля такие:
 
-- expose only one GPU with `NVIDIA_VISIBLE_DEVICES=0`;
-- reduce `PADDLE_GPU_MEMORY_FRACTION`;
-- keep LLM inference outside this app container, for example in a separate Ollama service/host process;
-- monitor with `nvidia-smi`.
+- пробросить только одну GPU через `NVIDIA_VISIBLE_DEVICES=0`;
+- уменьшить `PADDLE_GPU_MEMORY_FRACTION`;
+- держать LLM inference вне контейнера приложения, например в отдельном Ollama service или host process;
+- мониторить потребление через `nvidia-smi`.
 
-## LLM runtime options
+## Варианты запуска LLM
 
-The app can work with an external Ollama server, with Ollama inside Compose, or in a degraded deterministic fallback mode.
+Приложение может работать с внешним Ollama server, с Ollama внутри Compose или в degraded deterministic fallback mode.
 
-### Option A — Ollama on the host
+### Вариант A — Ollama на хосте
 
-Use this when Ollama is already installed on the developer machine:
+Используйте этот вариант, если Ollama уже установлена на машине разработчика:
 
 ```env
 LLM_BASE_URL=http://host.docker.internal:11434/v1
@@ -105,17 +104,17 @@ FALLBACK_ON_LLM_ERROR=true
 LLM_MAX_RETRIES=0
 ```
 
-On Linux `host.docker.internal` is enabled by `extra_hosts: host.docker.internal:host-gateway` in Compose.
+На Linux `host.docker.internal` включается через `extra_hosts: host.docker.internal:host-gateway` в Compose.
 
-Check availability:
+Проверка доступности:
 
 ```bash
 curl http://localhost:8000/health/llm
 ```
 
-### Option B — self-contained Ollama in Compose
+### Вариант B — self-contained Ollama в Compose
 
-This avoids depending on Ollama installed on the reviewer machine. It starts an `ollama` service and an `ollama-pull` init service that downloads the configured model into the `ollama_data` volume.
+Этот вариант не зависит от Ollama, установленной на машине проверяющего. Он запускает service `ollama` и init service `ollama-pull`, который скачивает настроенную модель в volume `ollama_data`.
 
 CPU:
 
@@ -124,25 +123,25 @@ cp .env.cpu.example .env
 docker compose -f docker-compose.cpu.yml -f docker-compose.ollama.yml --env-file .env up --build
 ```
 
-GPU OCR app with the same Ollama override:
+GPU OCR app с тем же Ollama override:
 
 ```bash
 cp .env.gpu.example .env
 docker compose -f docker-compose.gpu.yml -f docker-compose.ollama.yml --env-file .env up --build
 ```
 
-The model can be changed before startup:
+Модель можно изменить до запуска:
 
 ```env
 OLLAMA_MODEL=qwen2.5:7b-instruct
 LLM_MODEL=qwen2.5:7b-instruct
 ```
 
-For weaker reviewer machines you may choose a smaller Ollama model, but keep `LLM_MODEL` and `OLLAMA_MODEL` identical.
+Для более слабых машин проверяющих можно выбрать меньшую Ollama-модель, но `LLM_MODEL` и `OLLAMA_MODEL` должны совпадать.
 
-### Option C — no LLM / deterministic fallback
+### Вариант C — без LLM / deterministic fallback
 
-This mode is useful when no local LLM is available. It will not be as accurate as LLM extraction, but the pipeline will still produce conservative candidates instead of returning an empty result after timeouts.
+Этот режим полезен, когда локальная LLM недоступна. Он не будет таким точным, как LLM extraction, но pipeline всё равно будет выдавать консервативных кандидатов вместо пустого результата после timeout.
 
 ```env
 ENABLE_LLM=false
@@ -150,9 +149,9 @@ ENABLE_REGEX_FALLBACK=true
 FALLBACK_ON_LLM_ERROR=true
 ```
 
-When LLM is enabled but unavailable or too slow, `ENABLE_REGEX_FALLBACK=true` and `FALLBACK_ON_LLM_ERROR=true` make extraction degrade to the regex/table fallback.
+Когда LLM включена, но недоступна или отвечает слишком медленно, `ENABLE_REGEX_FALLBACK=true` и `FALLBACK_ON_LLM_ERROR=true` переводят extraction в regex/table fallback.
 
-## Useful commands
+## Полезные команды
 
 ```bash
 # CPU logs
@@ -164,43 +163,42 @@ docker compose -f docker-compose.gpu.yml logs -f app
 # DB shell
 docker compose -f docker-compose.cpu.yml exec db psql -U postgres -d ocr_db
 
-# Stop and keep volumes
+# Остановить и сохранить volumes
 docker compose -f docker-compose.cpu.yml down
 
-# Stop and delete volumes
+# Остановить и удалить volumes
 docker compose -f docker-compose.cpu.yml down -v
 ```
 
-### Ollama port conflicts
+### Конфликты портов Ollama
 
-`docker-compose.ollama.yml` does **not** publish Ollama's `11434` port to the host by default.
-The app container talks to Ollama through the internal Compose network:
+`docker-compose.ollama.yml` по умолчанию **не публикует** порт Ollama `11434` на хост. Контейнер приложения обращается к Ollama через внутреннюю Compose-сеть:
 
 ```env
 LLM_BASE_URL=http://ollama:11434/v1
 ```
 
-This avoids the common error:
+Это позволяет избежать распространённой ошибки:
 
 ```text
 ports are not available: exposing port TCP 0.0.0.0:11434 ... Only one usage of each socket address
 ```
 
-That error means you already have Ollama running on the host and occupying port `11434`.
+Эта ошибка означает, что Ollama уже запущена на хосте и занимает порт `11434`.
 
-If you want to expose the Compose Ollama service to the host anyway, use the optional port override. It publishes to host port `11435` by default:
+Если всё же нужно открыть Compose Ollama service на хосте, используйте optional port override. По умолчанию он публикует сервис на host port `11435`:
 
 ```bash
 docker compose -f docker-compose.cpu.yml -f docker-compose.ollama.yml -f docker-compose.ollama-port.yml --env-file .env up --build
 ```
 
-Then from the host you can use:
+После этого с хоста можно использовать:
 
 ```bash
 curl http://localhost:11435/v1/models
 ```
 
-If you want to use your already-running host Ollama instead of containerized Ollama, do not include `docker-compose.ollama.yml`; keep:
+Если нужно использовать уже запущенную host Ollama вместо containerized Ollama, не подключайте `docker-compose.ollama.yml`; оставьте:
 
 ```env
 LLM_BASE_URL=http://host.docker.internal:11434/v1
